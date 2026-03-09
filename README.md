@@ -1,18 +1,18 @@
 # Where Should We Eat?
 
-A real-time web app that helps groups decide on a restaurant through live voting. Create a room, add options, vote, and get a winner in under 2 minutes.
+A real-time app that helps groups decide on a restaurant through live voting. Create a room, add options, vote, and get a winner in under 2 minutes.
 
 ## Tech Stack
 
-- **Frontend**: Next.js, React, TailwindCSS
+- **Frontend**: Flutter (Dart)
 - **Backend**: FastAPI (Python)
-- **Real-time**: WebSockets (to be implemented)
+- **Real-time**: Socket.IO (WebSockets)
 
 ## Prerequisites
 
-- Node.js 18+
+- Flutter SDK (3.0+)
 - Python 3.10+
-- npm (or pnpm/yarn)
+- pip (or uv)
 
 ## Setup
 
@@ -24,29 +24,32 @@ cd Where-Should-We-Eat
 
 ### 2. Backend (FastAPI)
 
+From the project root:
+
 ```bash
-cd backend
-python -m venv venv
-source venv/bin/activate   # On Windows: venv\Scripts\activate
-pip install -r requirements.txt
-uvicorn main:app --reload --host 0.0.0.0 --port 8000
+python -m venv .venv
+source .venv/bin/activate   # On Windows: .venv\Scripts\activate
+pip install -r backend/requirements.txt
+uvicorn backend.main:app --reload --host 0.0.0.0 --port 8080
 ```
 
-Backend runs at: **http://localhost:8000**
+Backend runs at: **http://localhost:8080**
 
-- API docs: http://localhost:8000/docs
+- API docs: http://localhost:8080/docs
 
-### 3. Frontend (Next.js)
+### 3. Frontend (Flutter)
 
 In a new terminal:
 
 ```bash
 cd frontend
-npm install
-npm run dev
+flutter pub get
+flutter run
 ```
 
-Frontend runs at: **http://localhost:3000**
+Run on a connected device or simulator (iOS/Android), or use `flutter run -d chrome` for web.
+
+The app expects the API at **http://localhost:8080** by default.
 
 ## Project Structure
 
@@ -54,19 +57,24 @@ Frontend runs at: **http://localhost:3000**
 Where-Should-We-Eat/
 ├── backend/           # FastAPI app
 │   ├── main.py
+│   ├── store.py
+│   ├── services/
 │   └── requirements.txt
-├── frontend/          # Next.js app
-│   ├── src/
-│   │   ├── app/
-│   │   └── lib/
-│   └── package.json
+├── frontend/           # Flutter app
+│   ├── lib/
+│   │   ├── api_client.dart
+│   │   ├── models.dart
+│   │   ├── providers/
+│   │   ├── screens/
+│   │   └── ...
+│   └── pubspec.yaml
 └── README.md
 ```
 
 ## Development
 
 - Run backend and frontend in separate terminals.
-- Backend: `uvicorn main:app --reload --port 8000`
-- Frontend: `npm run dev`
+- Backend: `uvicorn backend.main:app --reload --port 8080` (from project root)
+- Frontend: `flutter run` (from `frontend/`)
 
 See individual files for TODO items and implementation notes.

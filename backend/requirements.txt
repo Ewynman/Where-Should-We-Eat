@@ -1,7 +1,6 @@
 # Where Should We Eat? - FastAPI Backend
-# TODO: Add uvicorn[standard] when running WebSocket server
-# TODO: Add python-socketio or websockets for real-time voting
-# TODO: Add sqlalchemy + asyncpg or databases for PostgreSQL
-# TODO: Add pydantic-settings for config
 fastapi>=0.109.0
 uvicorn[standard]>=0.27.0
+httpx>=0.27.0
+python-dotenv>=1.0.0
+python-socketio>=5.10.0
