@@ -1,8 +1,24 @@
 # Python
 backend/venv/
+backend/.venv/
+.venv/
 backend/__pycache__/
+__pycache__/
 *.pyc
 .pytest_cache/
+
+# Node / Frontend
+node_modules/
+frontend/node_modules/
+
+# Build / IDE
+frontend/build/
+.cursor/
+.vscode/
+*.log
+
+# macOS
+.DS_Store
 
 # Env
 .env
