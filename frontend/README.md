@@ -1,36 +1,42 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Frontend (Flutter)
 
-## Getting Started
+This folder is now a Flutter app for web and mobile that replaces the prior Next.js frontend.
 
-First, run the development server:
+## Run
 
 ```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+flutter pub get
+flutter run
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+## Configure backend URLs
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+Defaults:
+- API: `http://localhost:8000`
+- Socket: `http://localhost:8000`
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+Override via Dart defines:
 
-## Learn More
+```bash
+flutter run --dart-define=API_BASE_URL=http://localhost:8000 --dart-define=WS_BASE_URL=http://localhost:8000
+```
 
-To learn more about Next.js, take a look at the following resources:
+## Included flows
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+- Create room
+- Join room
+- Add up to 4 suggestions
+- Start voting with geolocation (host)
+- Live room updates via Socket.IO
+- Vote and show winner/results
+- Restart session
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+## Location permission flow
 
-## Deploy on Vercel
-
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
-
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+- Permission request is triggered when host taps **Start voting**
+- App stores two local flags in SharedPreferences:
+  - `locationPermissionPrompted`
+  - `locationPermissionGranted`
+- If denied, the app shows guidance plus:
+  - **Settings** action
+  - **Continue with demo location** fallback
