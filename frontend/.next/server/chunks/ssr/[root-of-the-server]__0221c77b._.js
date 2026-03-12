@@ -1,3 +1,0 @@
-module.exports=[71064,a=>{a.v({className:"outfit_2d4f0fd4-module__F8xy9G__className",variable:"outfit_2d4f0fd4-module__F8xy9G__variable"})},27572,a=>{"use strict";var b=a.i(7997),c=a.i(71064);let d={className:c.default.className,style:{fontFamily:"'Outfit', 'Outfit Fallback'",fontStyle:"normal"}};function e({children:a}){return(0,b.jsx)("html",{lang:"en",children:(0,b.jsx)("body",{className:`${d.className} antialiased`,children:a})})}null!=c.default.variable&&(d.variable=c.default.variable),a.s(["default",()=>e,"metadata",0,{title:"Where Should We Eat?",description:"Decide on a restaurant with your group in under 2 minutes."}],27572)}];
-
-//# sourceMappingURL=%5Broot-of-the-server%5D__0221c77b._.js.map
