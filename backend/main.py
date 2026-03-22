@@ -1,63 +1,140 @@
+import asyncio
 import logging
-import sys
-import uuid
-from pathlib import Path
+import random
+import string
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 
-# When run as "uvicorn backend.main:app" from project root, backend dir must be on path
-_backend_dir = Path(__file__).resolve().parent
-if str(_backend_dir) not in sys.path:
-    sys.path.insert(0, str(_backend_dir))
-
-import socketio
-from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Request
+from bson.objectid import ObjectId
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pymongo import MongoClient
 
-load_dotenv(_backend_dir / ".env")
+from schemas.rooms import CreateRoomBody, JoinRoomBody
+from settings import Settings
 
-app = FastAPI(title="Where Should We Eat?", version="0.1.0")
+settings = Settings()
 
-# Socket.IO for real-time room_update broadcasts (TODO: emit when room state changes)
-sio = socketio.AsyncServer(async_mode="asgi", cors_allowed_origins="*")
-sio_app = socketio.ASGIApp(sio)
-app.mount("/socket.io", sio_app)
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
+mongo_details = {}
 
-@sio.event
-async def connect(sid, environ):
-    pass
+VOTE_DURATION_SECONDS = 60
 
 
-@sio.event
-async def disconnect(sid):
-    pass
+# ---------------------------------------------------------------------------
+# Connection Manager
+# ---------------------------------------------------------------------------
 
 
-@sio.event
-async def join_room(sid, data):
-    if isinstance(data, str):
-        code = data.strip().upper()
-    else:
-        code = (data or "").strip().upper()
-    if code:
-        await sio.enter_room(sid, code)
+class ConnectionManager:
+    """
+    Tracks active WebSocket connections grouped by room_id.
+
+    Structure:
+        self.rooms = {
+            "room_id_abc": {websocket_1, websocket_2, ...},
+            "room_id_xyz": {websocket_3, ...},
+        }
+
+    """
+
+    def __init__(self):
+        self.rooms: dict[str, set[WebSocket]] = {}
+
+    async def connect(self, room_id: str, websocket: WebSocket):
+        """Accept the connection and register it under the given room."""
+        await websocket.accept()
+        self.rooms.setdefault(room_id, set()).add(websocket)
+        logger.info(
+            "WS connected  room=%s  total=%d", room_id, len(self.rooms[room_id])
+        )
+
+    def disconnect(self, room_id: str, websocket: WebSocket):
+        """Remove the connection.  Cleans up the room entry if it becomes empty."""
+        room = self.rooms.get(room_id, set())
+        room.discard(websocket)
+        if not room:
+            self.rooms.pop(room_id, None)
+        logger.info("WS disconnected  room=%s  remaining=%d", room_id, len(room))
+
+    async def broadcast(self, room_id: str, message: dict):
+        """
+        Send a JSON message to every connected client in a room.
+
+        Dead connections are collected and removed so stale sockets don't
+        accumulate.  We never raise inside this method - a single bad socket
+        should not prevent the others from receiving the message.
+        """
+        dead: list[WebSocket] = []
+        for ws in list(self.rooms.get(room_id, [])):
+            try:
+                await ws.send_json(message)
+            except Exception:
+                dead.append(ws)
+        for ws in dead:
+            self.disconnect(room_id, ws)
 
 
-@sio.event
-async def leave_room(sid, data):
-    if isinstance(data, str):
-        code = data.strip().upper()
-    else:
-        code = (data or "").strip().upper()
-    if code:
-        await sio.leave_room(sid, code)
+manager = ConnectionManager()
 
 
-async def broadcast_room_update(room_code: str) -> None:
-    """TODO: load room from store and emit room_update to room."""
-    pass
+# ---------------------------------------------------------------------------
+# Timer helper
+# ---------------------------------------------------------------------------
 
+
+async def run_voting_timer(room_id: str, duration: int):
+    """
+    Background task that waits `duration` seconds, then:
+      1. Reads the current vote tallies from MongoDB.
+      2. Picks the winner (random tie-break).
+      3. Updates the room status in MongoDB.
+      4. Broadcasts a `voting_ended` event to every client still in the room.
+    """
+    await asyncio.sleep(duration)
+
+    room = mongo_details["rooms"].find_one({"_id": ObjectId(room_id)})
+    if not room or room.get("status") != "voting":
+        return  # room was already closed or restarted
+
+    options = room.get("options", [])
+    max_votes = max((o["votes"] for o in options), default=0)
+    winners = [o for o in options if o["votes"] == max_votes]
+    winner = random.choice(winners)["name"]
+
+    mongo_details["rooms"].update_one(
+        {"_id": ObjectId(room_id)},
+        {"$set": {"status": "finished", "winner": winner}},
+    )
+
+    await manager.broadcast(
+        room_id,
+        {
+            "type": "voting_ended",
+            "winner": winner,
+            "options": options,
+        },
+    )
+    logger.info("Voting ended  room=%s  winner=%s", room_id, winner)
+
+
+# ---------------------------------------------------------------------------
+# App setup
+# ---------------------------------------------------------------------------
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    mongo_details["client"] = MongoClient(settings.MONGO_URI)
+    mongo_details["db"] = mongo_details["client"][settings.MONGO_DB]
+    mongo_details["rooms"] = mongo_details["db"][settings.MONGO_ROOMS_COLLECTION]
+    yield
+    mongo_details["client"].close()
+
+
+app = FastAPI(title="Where Should We Eat?", version="0.1.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -68,85 +145,18 @@ app.add_middleware(
 )
 
 
-logger = logging.getLogger("where-should-we-eat")
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
-)
-
-MAX_OPTIONS = 10
-
-# --- Mock data for frontend. Use code ABCD12 to join/get room. ---
-MOCK_ROOM_CODE = "ABCD12"
-MOCK_HOST_ID = "mock-host-id"
-MOCK_ROOM_ID = "mock-room-id"
+# ---------------------------------------------------------------------------
+# Utility
+# ---------------------------------------------------------------------------
 
 
-def _mock_room_response(
-    status: str = "waiting",
-    options: list[dict] | None = None,
-    participants: list[dict] | None = None,
-) -> dict:
-    if options is None:
-        options = []
-    if participants is None:
-        participants = [
-            {"id": MOCK_HOST_ID, "name": "Host", "hasVoted": False},
-        ]
-    return {
-        "id": MOCK_ROOM_ID,
-        "code": MOCK_ROOM_CODE,
-        "hostId": MOCK_HOST_ID,
-        "status": status,
-        "endTime": None,
-        "options": options,
-        "participants": participants,
-    }
+def generate_room_code():
+    return "".join(random.choices(string.ascii_uppercase, k=5))
 
 
-# --- Pydantic request bodies (API contract) ---
-
-
-class CreateRoomBody(BaseModel):
-    name: str
-
-
-class JoinRoomBody(BaseModel):
-    code: str
-    name: str
-
-
-class AddOptionBody(BaseModel):
-    name: str
-    userId: str
-    cuisineType: str
-
-
-class VoteBody(BaseModel):
-    optionId: str
-    userId: str
-
-
-class RestartBody(BaseModel):
-    userId: str
-
-
-class StartVotingBody(BaseModel):
-    userId: str
-    durationSeconds: int = 60
-    latitude: float
-    longitude: float
-
-
-# --- Route handlers (templates: mock responses only) ---
-
-
-@app.middleware("http")
-async def request_logger(request: Request, call_next):
-    logger.info("[REQ] %s %s", request.method, request.url.path)
-    response = await call_next(request)
-    logger.info("[RES] %s %s -> %s", request.method, request.url.path, response.status_code)
-    return response
+# ---------------------------------------------------------------------------
+# HTTP Routes
+# ---------------------------------------------------------------------------
 
 
 @app.get("/")
@@ -159,57 +169,240 @@ def health():
     return {"status": "healthy"}
 
 
-@app.post("/api/rooms", status_code=201)
+@app.get("/room/{room_id}", status_code=200)
+async def get_room(room_id: str):
+    room = mongo_details["rooms"].find_one({"_id": ObjectId(room_id)})
+    if not room:
+        raise HTTPException(status_code=404, detail="Room not found")
+    room["_id"] = str(room["_id"])
+    return room
+
+
+@app.post("/create-room", status_code=201)
 async def create_room(body: CreateRoomBody):
-    # TODO: validate name, generate room + host via store, persist, broadcast.
-    room = _mock_room_response()
-    user = {"id": MOCK_HOST_ID, "name": (body.name.strip() or "Host")}
-    return {"room": room, "user": user}
+    room_id = ObjectId()
+    room_code = generate_room_code()
 
+    # TODO: replace with real Google Places API call
+    restaurants = [
+        {"name": "Chipotle", "votes": 0},
+        {"name": "Five Guys", "votes": 0},
+        {"name": "Sushi Palace", "votes": 0},
+        {"name": "Taco Bell", "votes": 0},
+    ]
 
-@app.post("/api/rooms/join")
-async def join_room(body: JoinRoomBody):
-    # TODO: load room by code from store, validate, add user, persist, broadcast.
-    room = _mock_room_response()
-    user = {"id": str(uuid.uuid4()), "name": (body.name.strip() or "Guest")}
-    return {"room": room, "user": user}
-
-
-@app.get("/api/rooms/{room_code}")
-async def get_room(room_code: str):
-    # TODO: load room from store, maybe_finish_room, return room_to_response.
-    room = _mock_room_response()
-    return room
-
-
-@app.post("/api/rooms/{room_code}/options", status_code=201)
-async def add_option(room_code: str, body: AddOptionBody):
-    # TODO: ensure room, ensure user in room, validate status/limits, append option, persist, broadcast.
-    option = {
-        "id": str(uuid.uuid4()),
-        "roomId": MOCK_ROOM_ID,
-        "name": (body.name.strip() or "Option"),
-        "voteCount": 0,
-        "cuisineType": (body.cuisineType.strip() or "cuisine").lower(),
-        "source": "cuisine",
+    new_room = {
+        "_id": room_id,
+        "code": room_code,
+        "hostId": body.host_name,
+        "status": "waiting",  # waiting → voting → finished
+        "endTime": None,
+        "winner": None,
+        "options": restaurants,
+        "participants": [{"username": body.host_name}],
+        "voters": [],  # tracks who has already voted
     }
-    return option
+    mongo_details["rooms"].insert_one(new_room)
+    return {"room_id": str(room_id), "code": room_code, "restaurants": restaurants}
 
 
-@app.post("/api/rooms/{room_code}/start")
-async def start_voting(room_code: str, body: StartVotingBody):
-    # TODO: ensure room, ensure host, set status to cuisine_voting, persist, broadcast.
-    return {}
+@app.post("/join-room", status_code=200)
+def join_room(body: JoinRoomBody):
+    room = mongo_details["rooms"].find_one({"_id": ObjectId(body.room_id)})
+    if not room:
+        raise HTTPException(status_code=404, detail="Room not found")
+    if room["code"] != body.code:
+        raise HTTPException(status_code=403, detail="Invalid room code")
+    if room["status"] != "waiting":
+        raise HTTPException(status_code=400, detail="Voting has already started")
+
+    registered = [u["username"] for u in room["participants"]]
+    if body.username in registered:
+        raise HTTPException(
+            status_code=400, detail="Username already taken in this room"
+        )
+
+    mongo_details["rooms"].update_one(
+        {"_id": ObjectId(body.room_id)},
+        {"$push": {"participants": {"username": body.username}}},
+    )
+    return {
+        "room_id": body.room_id,
+        "code": room["code"],
+        "restaurants": room["options"],
+        "participants": room["participants"] + [{"username": body.username}],
+    }
 
 
-@app.post("/api/rooms/{room_code}/vote")
-async def vote(room_code: str, body: VoteBody):
-    # TODO: ensure room and user, apply vote, maybe_finish_room, persist, broadcast.
-    return {}
+# ---------------------------------------------------------------------------
+# WebSocket Route
+# ---------------------------------------------------------------------------
 
 
-@app.post("/api/rooms/{room_code}/restart")
-async def restart_room(room_code: str, body: RestartBody):
-    # TODO: ensure room, ensure host, reset status/options, persist, broadcast.
-    room = _mock_room_response(status="waiting", options=[])
-    return room
+@app.websocket("/ws/{room_id}")
+async def websocket_endpoint(websocket: WebSocket, room_id: str):
+    """
+    Persistent connection for a single client in a room.
+
+    Expected inbound message shapes
+    ────────────────────────────────
+    { "type": "join",  "username": "Alice" }
+        → broadcasts updated participant list to everyone in the room.
+
+    { "type": "start_voting", "username": "Alice" }
+        → host-only action; transitions room to "voting", starts the 60-second
+          timer, and broadcasts voting_started with end_time to all clients.
+
+    { "type": "vote", "username": "Alice", "restaurant": "Chipotle" }
+        → records Alice's vote (one per user), updates MongoDB, and broadcasts
+          updated tallies to all clients.
+
+    Outbound broadcast message shapes
+    ────────────────────────────────────
+    { "type": "user_joined",    "participants": [...] }
+    { "type": "voting_started", "end_time": <ISO-8601 UTC string>, "options": [...] }
+    { "type": "vote_update",    "options": [...] }
+    { "type": "voting_ended",   "winner": "Chipotle", "options": [...] }
+    { "type": "error",          "message": "..." }   ← sent only to the sender
+    """
+
+    await manager.connect(room_id, websocket)
+
+    try:
+        while True:
+            data = await websocket.receive_json()
+            msg_type = data.get("type")
+            username = data.get("username", "")
+
+            # ── JOIN ────────────────────────────────────────────────────────
+            if msg_type == "join":
+                room = mongo_details["rooms"].find_one({"_id": ObjectId(room_id)})
+                if not room:
+                    await websocket.send_json(
+                        {"type": "error", "message": "Room not found"}
+                    )
+                    continue
+
+                await manager.broadcast(
+                    room_id,
+                    {
+                        "type": "user_joined",
+                        "participants": room["participants"],
+                    },
+                )
+
+            # ── START VOTING ────────────────────────────────────────────────
+            elif msg_type == "start_voting":
+                room = mongo_details["rooms"].find_one({"_id": ObjectId(room_id)})
+                if not room:
+                    await websocket.send_json(
+                        {"type": "error", "message": "Room not found"}
+                    )
+                    continue
+                if room["hostId"] != username:
+                    await websocket.send_json(
+                        {"type": "error", "message": "Only the host can start voting"}
+                    )
+                    continue
+                if room["status"] != "waiting":
+                    await websocket.send_json(
+                        {"type": "error", "message": "Voting already started"}
+                    )
+                    continue
+
+                end_time = (
+                    datetime.now(timezone.utc).timestamp() + VOTE_DURATION_SECONDS
+                )
+                end_time_iso = datetime.fromtimestamp(
+                    end_time, tz=timezone.utc
+                ).isoformat()
+
+                mongo_details["rooms"].update_one(
+                    {"_id": ObjectId(room_id)},
+                    {"$set": {"status": "voting", "endTime": end_time_iso}},
+                )
+
+                await manager.broadcast(
+                    room_id,
+                    {
+                        "type": "voting_started",
+                        "end_time": end_time_iso,
+                        "options": room["options"],
+                    },
+                )
+
+                # Fire-and-forget timer — runs concurrently without blocking
+                # any other messages.
+                asyncio.create_task(run_voting_timer(room_id, VOTE_DURATION_SECONDS))
+
+            # ── VOTE ────────────────────────────────────────────────────────
+            elif msg_type == "vote":
+                restaurant_name = data.get("restaurant")
+                if not restaurant_name:
+                    await websocket.send_json(
+                        {"type": "error", "message": "Missing restaurant field"}
+                    )
+                    continue
+
+                room = mongo_details["rooms"].find_one({"_id": ObjectId(room_id)})
+                if not room:
+                    await websocket.send_json(
+                        {"type": "error", "message": "Room not found"}
+                    )
+                    continue
+                if room["status"] != "voting":
+                    await websocket.send_json(
+                        {"type": "error", "message": "Voting is not active"}
+                    )
+                    continue
+                if username in room.get("voters", []):
+                    await websocket.send_json(
+                        {"type": "error", "message": "You have already voted"}
+                    )
+                    continue
+
+                # Atomically increment the vote and record the voter.
+                result = mongo_details["rooms"].update_one(
+                    {
+                        "_id": ObjectId(room_id),
+                        "options.name": restaurant_name,
+                        "voters": {"$ne": username},  # extra guard against duplicates
+                    },
+                    {
+                        "$inc": {"options.$.votes": 1},
+                        "$push": {"voters": username},
+                    },
+                )
+                if result.modified_count == 0:
+                    await websocket.send_json(
+                        {"type": "error", "message": "Vote could not be recorded"}
+                    )
+                    continue
+
+                updated_room = mongo_details["rooms"].find_one(
+                    {"_id": ObjectId(room_id)}
+                )
+                await manager.broadcast(
+                    room_id,
+                    {
+                        "type": "vote_update",
+                        "options": updated_room["options"],
+                    },
+                )
+
+            # ── Restart (Optional) ──────────────────────────────────────────
+            # TODO : complete this
+
+
+            else:
+                await websocket.send_json(
+                    {"type": "error", "message": f"Unknown message type: {msg_type}"}
+                )
+
+
+    except WebSocketDisconnect:
+        manager.disconnect(room_id, websocket)
+        logger.info("Client disconnected cleanly  room=%s", room_id)
+    except Exception as e:
+        logger.exception("Unexpected WS error  room=%s", room_id)
+        manager.disconnect(room_id, websocket)
