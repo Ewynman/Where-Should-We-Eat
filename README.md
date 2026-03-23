@@ -6,7 +6,7 @@ A real-time app that helps groups decide on a restaurant through live voting. Cr
 
 - **Frontend**: Flutter (Dart)
 - **Backend**: FastAPI (Python)
-- **Real-time**: Socket.IO (WebSockets)
+- **Real-time**: WebSockets + polling fallback
 
 ## Prerequisites
 
@@ -14,7 +14,7 @@ A real-time app that helps groups decide on a restaurant through live voting. Cr
 - Python 3.10+
 - pip (or uv)
 
-## Setup
+## Local Setup (without Docker)
 
 ### 1. Clone and enter the project
 
@@ -71,10 +71,57 @@ Where-Should-We-Eat/
 └── README.md
 ```
 
-## Development
+## Docker (3 containers)
 
-- Run backend and frontend in separate terminals.
-- Backend: `uvicorn backend.main:app --reload --port 8080` (from project root)
-- Frontend: `flutter run` (from `frontend/`)
+This repo can run as 3 services:
+- `frontend` (Flutter web + Nginx) at [http://localhost:3000](http://localhost:3000)
+- `backend` (FastAPI) at [http://localhost:8080](http://localhost:8080)
+- `db` (MongoDB) at `localhost:27017`
 
-See individual files for TODO items and implementation notes.
+### 1) Prepare backend env
+
+Create `backend/.env` with the settings your backend expects (`MONGO_DB`, `MONGO_ROOMS_COLLECTION`, API keys, etc.).
+`MONGO_URI` is overridden in Docker Compose to point to the Mongo container.
+
+### 2) Build and run
+
+Use whichever Compose command your machine supports:
+
+```bash
+docker compose up --build
+```
+
+or
+
+```bash
+docker-compose up --build
+```
+
+### 3) Stop
+
+```bash
+docker compose down
+```
+
+or
+
+```bash
+docker-compose down
+```
+
+To also remove the Mongo volume:
+
+```bash
+docker compose down -v
+```
+
+or
+
+```bash
+docker-compose down -v
+```
+
+## Notes
+
+- The only project-level README is this root `README.md`.
+- `frontend/` and `backend/` do not contain app-level README files.
