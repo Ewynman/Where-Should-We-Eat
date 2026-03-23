@@ -39,7 +39,7 @@ class _JoinRoomPageState extends State<JoinRoomPage> {
       Navigator.pushReplacementNamed(
         context,
         '/room',
-        arguments: result.room.code,
+        arguments: result.room.id,
       );
     } catch (e) {
       if (!mounted) return;

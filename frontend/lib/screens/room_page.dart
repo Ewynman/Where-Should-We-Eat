@@ -30,8 +30,9 @@ void _debugLog(String message, Map<String, dynamic> data) {
     'data': data,
     'timestamp': DateTime.now().millisecondsSinceEpoch,
   };
-  http
-      .post(
+  unawaited(() async {
+    try {
+      await http.post(
         Uri.parse(
           'http://127.0.0.1:7542/ingest/e00f7f0d-6c0b-4cee-91cd-bbfb1a502ff5',
         ),
@@ -40,8 +41,9 @@ void _debugLog(String message, Map<String, dynamic> data) {
           'X-Debug-Session-Id': 'f5120d',
         },
         body: jsonEncode(payload),
-      )
-      .catchError((_) {});
+      );
+    } catch (_) {}
+  }());
 }
 // #endregion
 
@@ -100,7 +102,8 @@ class _RoomPageState extends ConsumerState<RoomPage> {
   void _configurePolling(RoomModel? room) {
     _pollingTimer?.cancel();
     if (room == null) return;
-    if (room.status == RoomStatus.voting ||
+    if (room.status == RoomStatus.waiting ||
+        room.status == RoomStatus.voting ||
         room.status == RoomStatus.cuisineVoting ||
         room.status == RoomStatus.restaurantVoting ||
         room.status == RoomStatus.fetchingRestaurants) {

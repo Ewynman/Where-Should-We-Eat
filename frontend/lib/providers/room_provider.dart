@@ -19,8 +19,9 @@ void _debugLog(String message, Map<String, dynamic> data) {
     'data': data,
     'timestamp': DateTime.now().millisecondsSinceEpoch,
   };
-  http
-      .post(
+  Future<void>(() async {
+    try {
+      await http.post(
         Uri.parse(
           'http://127.0.0.1:7542/ingest/e00f7f0d-6c0b-4cee-91cd-bbfb1a502ff5',
         ),
@@ -29,8 +30,9 @@ void _debugLog(String message, Map<String, dynamic> data) {
           'X-Debug-Session-Id': 'f5120d',
         },
         body: jsonEncode(payload),
-      )
-      .catchError((_) {});
+      );
+    } catch (_) {}
+  });
 }
 // #endregion
 
@@ -59,7 +61,6 @@ class RoomNotifier extends FamilyAsyncNotifier<RoomModel?, String> {
   }
 
   Future<void> refresh() async {
-    state = const AsyncLoading();
     try {
       state = AsyncData(await ApiClient.getRoom(_roomCode));
     } catch (e, st) {

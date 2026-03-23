@@ -10,8 +10,8 @@ from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pymongo import MongoClient
 
-from schemas.rooms import CreateRoomBody, JoinRoomBody
-from settings import Settings
+from backend.schemas.rooms import CreateRoomBody, JoinRoomBody, StartVotingBody, VoteBody
+from backend.settings import Settings
 
 settings = Settings()
 
@@ -100,9 +100,7 @@ async def run_voting_timer(room_id: str, duration: int):
         return  # room was already closed or restarted
 
     options = room.get("options", [])
-    max_votes = max((o["votes"] for o in options), default=0)
-    winners = [o for o in options if o["votes"] == max_votes]
-    winner = random.choice(winners)["name"]
+    winner = choose_winner(options)
 
     mongo_details["rooms"].update_one(
         {"_id": ObjectId(room_id)},
@@ -152,6 +150,40 @@ app.add_middleware(
 
 def generate_room_code():
     return "".join(random.choices(string.ascii_uppercase, k=5))
+
+
+def choose_winner(options: list[dict]) -> str | None:
+    if not options:
+        return None
+    max_votes = max((o.get("votes", 0) for o in options), default=0)
+    winners = [o for o in options if o.get("votes", 0) == max_votes]
+    if not winners:
+        return None
+    return random.choice(winners).get("name")
+
+
+async def maybe_finish_voting_early(room_id: str, room: dict) -> bool:
+    participants = room.get("participants", [])
+    voters = room.get("voters", [])
+    if not participants or len(voters) < len(participants):
+        return False
+
+    options = room.get("options", [])
+    winner = choose_winner(options)
+    mongo_details["rooms"].update_one(
+        {"_id": ObjectId(room_id)},
+        {"$set": {"status": "finished", "winner": winner}},
+    )
+    await manager.broadcast(
+        room_id,
+        {
+            "type": "voting_ended",
+            "winner": winner,
+            "options": options,
+        },
+    )
+    logger.info("Voting ended early  room=%s  winner=%s", room_id, winner)
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -208,10 +240,16 @@ async def create_room(body: CreateRoomBody):
 
 @app.post("/join-room", status_code=200)
 def join_room(body: JoinRoomBody):
-    room = mongo_details["rooms"].find_one({"_id": ObjectId(body.room_id)})
+    code_upper = body.code.strip().upper()
+    room = mongo_details["rooms"].find_one({"code": code_upper})
+    if room is None and body.room_id:
+        try:
+            room = mongo_details["rooms"].find_one({"_id": ObjectId(body.room_id)})
+        except Exception:
+            room = None
     if not room:
         raise HTTPException(status_code=404, detail="Room not found")
-    if room["code"] != body.code:
+    if room["code"] != code_upper:
         raise HTTPException(status_code=403, detail="Invalid room code")
     if room["status"] != "waiting":
         raise HTTPException(status_code=400, detail="Voting has already started")
@@ -223,15 +261,89 @@ def join_room(body: JoinRoomBody):
         )
 
     mongo_details["rooms"].update_one(
-        {"_id": ObjectId(body.room_id)},
+        {"_id": room["_id"]},
         {"$push": {"participants": {"username": body.username}}},
     )
     return {
-        "room_id": body.room_id,
+        "room_id": str(room["_id"]),
         "code": room["code"],
         "restaurants": room["options"],
         "participants": room["participants"] + [{"username": body.username}],
     }
+
+
+@app.post("/api/rooms/{room_id}/start", status_code=200)
+async def start_room_voting(room_id: str, body: StartVotingBody):
+    room = mongo_details["rooms"].find_one({"_id": ObjectId(room_id)})
+    if not room:
+        raise HTTPException(status_code=404, detail="Room not found")
+    if room["hostId"] != body.userId:
+        raise HTTPException(status_code=403, detail="Only the host can start voting")
+    if room["status"] != "waiting":
+        raise HTTPException(status_code=400, detail="Voting already started")
+
+    end_time = datetime.now(timezone.utc).timestamp() + body.durationSeconds
+    end_time_iso = datetime.fromtimestamp(end_time, tz=timezone.utc).isoformat()
+
+    mongo_details["rooms"].update_one(
+        {"_id": ObjectId(room_id)},
+        {"$set": {"status": "voting", "endTime": end_time_iso}},
+    )
+
+    await manager.broadcast(
+        room_id,
+        {
+            "type": "voting_started",
+            "end_time": end_time_iso,
+            "options": room["options"],
+        },
+    )
+
+    asyncio.create_task(run_voting_timer(room_id, body.durationSeconds))
+    return {"status": "ok", "end_time": end_time_iso}
+
+
+@app.post("/api/rooms/{room_id}/vote", status_code=200)
+async def vote_room_option(room_id: str, body: VoteBody):
+    room = mongo_details["rooms"].find_one({"_id": ObjectId(room_id)})
+    if not room:
+        raise HTTPException(status_code=404, detail="Room not found")
+    if room.get("status") != "voting":
+        raise HTTPException(status_code=400, detail="Voting is not active")
+
+    username = body.userId
+    if username in room.get("voters", []):
+        raise HTTPException(status_code=400, detail="You have already voted")
+
+    # Frontend currently sends optionId; in this backend options don't have IDs,
+    # so optionId is treated as option name.
+    option_name = body.optionId
+    result = mongo_details["rooms"].update_one(
+        {
+            "_id": ObjectId(room_id),
+            "options.name": option_name,
+            "voters": {"$ne": username},
+        },
+        {
+            "$inc": {"options.$.votes": 1},
+            "$push": {"voters": username},
+        },
+    )
+    if result.modified_count == 0:
+        raise HTTPException(status_code=400, detail="Vote could not be recorded")
+
+    updated_room = mongo_details["rooms"].find_one({"_id": ObjectId(room_id)})
+    if not updated_room:
+        raise HTTPException(status_code=404, detail="Room not found")
+    await manager.broadcast(
+        room_id,
+        {
+            "type": "vote_update",
+            "options": updated_room["options"],
+        },
+    )
+    ended = await maybe_finish_voting_early(room_id, updated_room)
+    return {"status": "ok", "ended": ended}
 
 
 # ---------------------------------------------------------------------------
@@ -382,6 +494,11 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str):
                 updated_room = mongo_details["rooms"].find_one(
                     {"_id": ObjectId(room_id)}
                 )
+                if not updated_room:
+                    await websocket.send_json(
+                        {"type": "error", "message": "Room not found"}
+                    )
+                    continue
                 await manager.broadcast(
                     room_id,
                     {
@@ -389,6 +506,7 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str):
                         "options": updated_room["options"],
                     },
                 )
+                await maybe_finish_voting_early(room_id, updated_room)
 
             # ── Restart (Optional) ──────────────────────────────────────────
             # TODO : complete this

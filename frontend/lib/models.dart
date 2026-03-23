@@ -32,9 +32,10 @@ class RoomParticipant {
   final bool hasVoted;
 
   factory RoomParticipant.fromJson(Map<String, dynamic> json) {
+    final name = (json['name'] ?? json['username'] ?? 'Guest').toString();
     return RoomParticipant(
-      id: json['id'] as String,
-      name: json['name'] as String? ?? 'Guest',
+      id: (json['id'] ?? name).toString(),
+      name: name,
       hasVoted: json['hasVoted'] as bool? ?? false,
     );
   }
@@ -78,11 +79,13 @@ class OptionModel {
         ? OptionSource.restaurant
         : OptionSource.cuisine;
 
+    final name = (json['name'] ?? '').toString();
+    final roomId = (json['roomId'] ?? '').toString();
     return OptionModel(
-      id: json['id'] as String,
-      roomId: json['roomId'] as String,
-      name: json['name'] as String,
-      voteCount: json['voteCount'] as int? ?? 0,
+      id: (json['id'] ?? name).toString(),
+      roomId: roomId,
+      name: name,
+      voteCount: (json['voteCount'] ?? json['votes']) as int? ?? 0,
       address: json['address'] as String?,
       imageUrl: (json['imageUrl'] ?? json['image_url']) as String?,
       cuisineType: (json['cuisineType'] ?? json['cuisine_type']) as String?,
@@ -128,9 +131,9 @@ class RoomModel {
     };
 
     return RoomModel(
-      id: json['id'] as String,
-      code: json['code'] as String,
-      hostId: json['hostId'] as String,
+      id: (json['id'] ?? json['_id'] ?? '').toString(),
+      code: (json['code'] ?? '').toString(),
+      hostId: (json['hostId'] ?? '').toString(),
       status: status,
       endTime: json['endTime'] == null
           ? null
