@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:geolocator/geolocator.dart';
 
 import '../api_client.dart';
 import '../components/buttons/app_button.dart';
@@ -28,6 +29,33 @@ class _CreateRoomPageState extends State<CreateRoomPage> {
     super.dispose();
   }
 
+  /// Same fallback as [RoomNotifier.startVoting] when GPS is unavailable.
+  static const _fallbackLat = 37.7749;
+  static const _fallbackLng = -122.4194;
+
+  Future<({double latitude, double longitude})> _resolveLocation() async {
+    try {
+      final serviceEnabled = await Geolocator.isLocationServiceEnabled();
+      if (!serviceEnabled) {
+        return (latitude: _fallbackLat, longitude: _fallbackLng);
+      }
+      var permission = await Geolocator.checkPermission();
+      if (permission == LocationPermission.denied) {
+        permission = await Geolocator.requestPermission();
+      }
+      if (permission == LocationPermission.denied ||
+          permission == LocationPermission.deniedForever) {
+        return (latitude: _fallbackLat, longitude: _fallbackLng);
+      }
+      final pos = await Geolocator.getCurrentPosition(
+        desiredAccuracy: LocationAccuracy.medium,
+      );
+      return (latitude: pos.latitude, longitude: pos.longitude);
+    } catch (_) {
+      return (latitude: _fallbackLat, longitude: _fallbackLng);
+    }
+  }
+
   Future<void> _submit() async {
     if (_nameController.text.trim().isEmpty) return;
     setState(() {
@@ -35,13 +63,18 @@ class _CreateRoomPageState extends State<CreateRoomPage> {
       _error = '';
     });
     try {
-      final result = await ApiClient.createRoom(_nameController.text.trim());
+      final coords = await _resolveLocation();
+      final result = await ApiClient.createRoom(
+        _nameController.text.trim(),
+        latitude: coords.latitude,
+        longitude: coords.longitude,
+      );
       await UserSession.saveUser(result.user);
       if (!mounted) return;
       Navigator.pushReplacementNamed(
         context,
         '/room',
-        arguments: result.room.code,
+        arguments: result.room.id,
       );
     } catch (e) {
       if (!mounted) return;

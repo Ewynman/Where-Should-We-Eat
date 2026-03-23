@@ -8,9 +8,10 @@ class CreateRoomBody(BaseModel):
 
 
 class JoinRoomBody(BaseModel):
+    """Join by room `code` (what users type). `room_id` is optional for deep links."""
     username: str
-    room_id: str
     code: str
+    room_id: str = ""
 
 
 class AddOptionBody(BaseModel):

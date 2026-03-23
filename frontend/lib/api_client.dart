@@ -48,38 +48,50 @@ class ApiClient {
     return decoded;
   }
 
-  static Future<RoomJoinResult> createRoom(String name) async {
-    final data = await _request('POST', '/api/rooms', body: {'name': name});
+  static Future<RoomJoinResult> createRoom(
+    String name, {
+    required double latitude,
+    required double longitude,
+  }) async {
+    final data = await _request(
+      'POST',
+      '/create-room',
+      body: {
+        'host_name': name,
+        'latitude': latitude,
+        'longitude': longitude,
+      },
+    );
     final map = data as Map<String, dynamic>;
-    final userMap = map['user'] as Map<String, dynamic>;
+    final roomId = map['room_id']?.toString() ?? '';
+    final room = await getRoom(roomId);
     return RoomJoinResult(
-      room: RoomModel.fromJson(map['room'] as Map<String, dynamic>),
-      user: UserModel(
-        id: userMap['id'] as String,
-        name: userMap['name'] as String,
-      ),
+      room: room,
+      user: UserModel(id: name, name: name),
     );
   }
 
   static Future<RoomJoinResult> joinRoom(String code, String name) async {
-    final data = await _request(
-      'POST',
-      '/api/rooms/join',
-      body: {'code': code.toUpperCase(), 'name': name},
-    );
+    final data = await _request('POST', '/join-room', body: {
+      'code': code.trim().toUpperCase(),
+      'username': name,
+    });
     final map = data as Map<String, dynamic>;
-    final userMap = map['user'] as Map<String, dynamic>;
     return RoomJoinResult(
-      room: RoomModel.fromJson(map['room'] as Map<String, dynamic>),
-      user: UserModel(
-        id: userMap['id'] as String,
-        name: userMap['name'] as String,
-      ),
+      room: RoomModel.fromJson({
+        '_id': map['room_id'],
+        'code': map['code'],
+        'hostId': '',
+        'status': 'waiting',
+        'options': map['restaurants'] ?? [],
+        'participants': map['participants'] ?? [],
+      }),
+      user: UserModel(id: name, name: name),
     );
   }
 
   static Future<RoomModel> getRoom(String roomCode) async {
-    final data = await _request('GET', '/api/rooms/$roomCode');
+    final data = await _request('GET', '/room/$roomCode');
     return RoomModel.fromJson(data as Map<String, dynamic>);
   }
 
