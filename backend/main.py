@@ -6,17 +6,25 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
 from bson.objectid import ObjectId
+import httpx
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response
 from pymongo import MongoClient, ReturnDocument
 
 from backend.schemas.rooms import (
+    AddOptionBody,
     CreateRoomBody,
     JoinRoomBody,
     KickBody,
+    RestartBody,
     StartVotingBody,
     TransferHostBody,
     VoteBody,
+)
+from backend.services.places_service import (
+    PLACES_BASE,
+    fetch_restaurant_options_for_cuisines,
 )
 from backend.settings import Settings
 
@@ -25,9 +33,15 @@ settings = Settings()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-mongo_details = {}
+mongo_details: dict = {}
 
 VOTE_DURATION_SECONDS = 60
+
+STATUS_WAITING = "waiting"
+STATUS_CUISINE_VOTING = "cuisine_voting"
+STATUS_FETCHING = "fetching_restaurants"
+STATUS_RESTAURANT_VOTING = "restaurant_voting"
+STATUS_FINISHED = "finished"
 
 KICKED_BY_HOST_MESSAGE = "You were removed from the room by the host."
 
@@ -81,10 +95,6 @@ class ConnectionManager:
         return rid, username
 
     def disconnect(self, room_id: str, websocket: WebSocket) -> str | None:
-        """
-        Remove the connection. Returns the bound username (if any) so callers
-        can schedule host failover.
-        """
         meta = self._unbind_socket(websocket)
         username = meta[1] if meta else None
         room = self.rooms.get(room_id, set())
@@ -95,13 +105,6 @@ class ConnectionManager:
         return username
 
     async def broadcast(self, room_id: str, message: dict):
-        """
-        Send a JSON message to every connected client in a room.
-
-        Dead connections are collected and removed so stale sockets don't
-        accumulate.  We never raise inside this method - a single bad socket
-        should not prevent the others from receiving the message.
-        """
         dead: list[WebSocket] = []
         for ws in list(self.rooms.get(room_id, [])):
             try:
@@ -129,7 +132,6 @@ class ConnectionManager:
     async def maybe_promote_host_after_disconnect(
         self, room_id: str, disconnected_username: str | None
     ) -> None:
-        """If the disconnected user was host, assign host to the first other participant."""
         if not disconnected_username:
             return
         room = mongo_details["rooms"].find_one({"_id": ObjectId(room_id)})
@@ -158,32 +160,156 @@ manager = ConnectionManager()
 
 
 # ---------------------------------------------------------------------------
-# Timer helper
+# Voting / phase helpers
 # ---------------------------------------------------------------------------
 
 
-async def run_voting_timer(room_id: str, duration: int):
-    """
-    Background task that waits `duration` seconds, then:
-      1. Reads the current vote tallies from MongoDB.
-      2. Picks the winner (random tie-break).
-      3. Updates the room status in MongoDB.
-      4. Broadcasts a `voting_ended` event to every client still in the room.
-    """
+def choose_winner(options: list[dict]) -> str | None:
+    if not options:
+        return None
+    max_votes = max((o.get("votes", 0) for o in options), default=0)
+    winners = [o for o in options if o.get("votes", 0) == max_votes]
+    if not winners:
+        return None
+    return random.choice(winners).get("name")
+
+
+def select_top_four_cuisine_labels(options: list[dict]) -> list[str]:
+    """Rank by votes (desc), random tie-break within same vote count; up to 4 labels."""
+    if not options:
+        return []
+    by_votes: dict[int, list[dict]] = {}
+    for o in options:
+        v = int(o.get("votes", 0) or 0)
+        by_votes.setdefault(v, []).append(o)
+    ordered: list[dict] = []
+    for v in sorted(by_votes.keys(), reverse=True):
+        bucket = by_votes[v]
+        random.shuffle(bucket)
+        ordered.extend(bucket)
+    top = ordered[:4]
+    labels: list[str] = []
+    for o in top:
+        label = (o.get("cuisineType") or o.get("name") or "").strip()
+        if label:
+            labels.append(label)
+    return labels
+
+
+async def cuisine_voting_timer(room_id: str, duration: int) -> None:
     await asyncio.sleep(duration)
-
     room = mongo_details["rooms"].find_one({"_id": ObjectId(room_id)})
-    if not room or room.get("status") != "voting":
-        return  # room was already closed or restarted
+    if not room or room.get("status") != STATUS_CUISINE_VOTING:
+        return
+    await finalize_cuisine_voting_and_start_fetch(room_id)
 
-    options = room.get("options", [])
-    winner = choose_winner(options)
 
-    mongo_details["rooms"].update_one(
-        {"_id": ObjectId(room_id)},
-        {"$set": {"status": "finished", "winner": winner}},
+async def finalize_cuisine_voting_and_start_fetch(room_id: str) -> None:
+    updated = mongo_details["rooms"].find_one_and_update(
+        {"_id": ObjectId(room_id), "status": STATUS_CUISINE_VOTING},
+        {"$set": {"status": STATUS_FETCHING, "voters": []}},
+        return_document=ReturnDocument.AFTER,
+    )
+    if not updated:
+        return
+
+    labels = select_top_four_cuisine_labels(updated.get("options", []))
+    lat = updated.get("hostLatitude")
+    lng = updated.get("hostLongitude")
+    duration = int(updated.get("voteDurationSeconds") or VOTE_DURATION_SECONDS)
+
+    await manager.broadcast(room_id, {"type": "fetching_started"})
+    asyncio.create_task(
+        run_places_fetch_job(room_id, labels, lat, lng, duration)
+    )
+    logger.info(
+        "Cuisine voting ended  room=%s  top_cuisines=%s",
+        room_id,
+        labels,
     )
 
+
+async def run_places_fetch_job(
+    room_id: str,
+    labels: list[str],
+    lat: float | None,
+    lng: float | None,
+    duration_seconds: int,
+) -> None:
+    if lat is None or lng is None:
+        mongo_details["rooms"].update_one(
+            {"_id": ObjectId(room_id), "status": STATUS_FETCHING},
+            {
+                "$set": {
+                    "status": STATUS_WAITING,
+                    "placesError": "Missing host location for restaurant search.",
+                    "voters": [],
+                }
+            },
+        )
+        await manager.broadcast(room_id, {"type": "fetching_failed"})
+        return
+
+    key = settings.google_places_key
+    opts, err = await fetch_restaurant_options_for_cuisines(
+        key, labels, float(lat), float(lng)
+    )
+    if err or not opts:
+        mongo_details["rooms"].update_one(
+            {"_id": ObjectId(room_id), "status": STATUS_FETCHING},
+            {
+                "$set": {
+                    "status": STATUS_WAITING,
+                    "placesError": err or "No restaurants found.",
+                    "voters": [],
+                }
+            },
+        )
+        await manager.broadcast(room_id, {"type": "fetching_failed"})
+        return
+
+    for o in opts:
+        o["id"] = str(ObjectId())
+
+    end_time = datetime.now(timezone.utc).timestamp() + duration_seconds
+    end_time_iso = datetime.fromtimestamp(end_time, tz=timezone.utc).isoformat()
+
+    mongo_details["rooms"].update_one(
+        {"_id": ObjectId(room_id), "status": STATUS_FETCHING},
+        {
+            "$set": {
+                "status": STATUS_RESTAURANT_VOTING,
+                "options": opts,
+                "voters": [],
+                "endTime": end_time_iso,
+                "placesError": None,
+            }
+        },
+    )
+    refreshed = mongo_details["rooms"].find_one({"_id": ObjectId(room_id)})
+    await manager.broadcast(
+        room_id,
+        {
+            "type": "voting_started",
+            "end_time": end_time_iso,
+            "options": refreshed.get("options", []) if refreshed else opts,
+        },
+    )
+    asyncio.create_task(restaurant_voting_timer(room_id, duration_seconds))
+    logger.info("Restaurant voting started  room=%s  options=%d", room_id, len(opts))
+
+
+async def restaurant_voting_timer(room_id: str, duration: int) -> None:
+    await asyncio.sleep(duration)
+    room = mongo_details["rooms"].find_one({"_id": ObjectId(room_id)})
+    if not room or room.get("status") != STATUS_RESTAURANT_VOTING:
+        return
+    options = room.get("options", [])
+    winner = choose_winner(options)
+    mongo_details["rooms"].update_one(
+        {"_id": ObjectId(room_id)},
+        {"$set": {"status": STATUS_FINISHED, "winner": winner}},
+    )
     await manager.broadcast(
         room_id,
         {
@@ -192,7 +318,43 @@ async def run_voting_timer(room_id: str, duration: int):
             "options": options,
         },
     )
-    logger.info("Voting ended  room=%s  winner=%s", room_id, winner)
+    logger.info("Restaurant voting ended  room=%s  winner=%s", room_id, winner)
+
+
+async def maybe_finish_cuisine_voting_early(room_id: str, room: dict) -> bool:
+    if room.get("status") != STATUS_CUISINE_VOTING:
+        return False
+    participants = room.get("participants", [])
+    voters = room.get("voters", [])
+    if not participants or len(voters) < len(participants):
+        return False
+    await finalize_cuisine_voting_and_start_fetch(room_id)
+    return True
+
+
+async def maybe_finish_restaurant_voting_early(room_id: str, room: dict) -> bool:
+    if room.get("status") != STATUS_RESTAURANT_VOTING:
+        return False
+    participants = room.get("participants", [])
+    voters = room.get("voters", [])
+    if not participants or len(voters) < len(participants):
+        return False
+    options = room.get("options", [])
+    winner = choose_winner(options)
+    mongo_details["rooms"].update_one(
+        {"_id": ObjectId(room_id)},
+        {"$set": {"status": STATUS_FINISHED, "winner": winner}},
+    )
+    await manager.broadcast(
+        room_id,
+        {
+            "type": "voting_ended",
+            "winner": winner,
+            "options": options,
+        },
+    )
+    logger.info("Restaurant voting ended early  room=%s  winner=%s", room_id, winner)
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -221,49 +383,6 @@ app.add_middleware(
 
 
 # ---------------------------------------------------------------------------
-# Utility
-# ---------------------------------------------------------------------------
-
-
-def generate_room_code():
-    return "".join(random.choices(string.ascii_uppercase, k=5))
-
-
-def choose_winner(options: list[dict]) -> str | None:
-    if not options:
-        return None
-    max_votes = max((o.get("votes", 0) for o in options), default=0)
-    winners = [o for o in options if o.get("votes", 0) == max_votes]
-    if not winners:
-        return None
-    return random.choice(winners).get("name")
-
-
-async def maybe_finish_voting_early(room_id: str, room: dict) -> bool:
-    participants = room.get("participants", [])
-    voters = room.get("voters", [])
-    if not participants or len(voters) < len(participants):
-        return False
-
-    options = room.get("options", [])
-    winner = choose_winner(options)
-    mongo_details["rooms"].update_one(
-        {"_id": ObjectId(room_id)},
-        {"$set": {"status": "finished", "winner": winner}},
-    )
-    await manager.broadcast(
-        room_id,
-        {
-            "type": "voting_ended",
-            "winner": winner,
-            "options": options,
-        },
-    )
-    logger.info("Voting ended early  room=%s  winner=%s", room_id, winner)
-    return True
-
-
-# ---------------------------------------------------------------------------
 # HTTP Routes
 # ---------------------------------------------------------------------------
 
@@ -276,6 +395,22 @@ def root():
 @app.get("/health")
 def health():
     return {"status": "healthy"}
+
+
+@app.get("/api/place-photo", response_class=Response)
+async def proxy_place_photo(photoName: str, maxPx: int = 800):
+    """Stream a Google Places photo without exposing the API key in the app."""
+    key = settings.google_places_key
+    if not key or not photoName.strip() or ".." in photoName:
+        raise HTTPException(status_code=400, detail="Invalid photo request")
+    px = max(120, min(int(maxPx), 1600))
+    url = f"{PLACES_BASE}/{photoName}/media?maxHeightPx={px}&maxWidthPx={px}&key={key}"
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        r = await client.get(url, follow_redirects=True)
+    if r.status_code != 200:
+        raise HTTPException(status_code=404, detail="Photo not available")
+    ct = r.headers.get("content-type", "image/jpeg")
+    return Response(content=r.content, media_type=ct)
 
 
 @app.get("/room/{room_id}", status_code=200)
@@ -292,28 +427,28 @@ async def create_room(body: CreateRoomBody):
     room_id = ObjectId()
     room_code = generate_room_code()
 
-    # TODO: replace with real Google Places API call
-    restaurants = [
-        {"name": "Chipotle", "votes": 0},
-        {"name": "Five Guys", "votes": 0},
-        {"name": "Sushi Palace", "votes": 0},
-        {"name": "Taco Bell", "votes": 0},
-    ]
-
     new_room = {
         "_id": room_id,
         "code": room_code,
         "hostId": body.host_name,
         "maxCapacity": body.max_capacity,
-        "status": "waiting",  # waiting → voting → finished
+        "status": STATUS_WAITING,
         "endTime": None,
         "winner": None,
-        "options": restaurants,
+        "options": [],
         "participants": [{"username": body.host_name}],
-        "voters": [],  # tracks who has already voted
+        "voters": [],
+        "hostLatitude": body.latitude,
+        "hostLongitude": body.longitude,
+        "placesError": None,
+        "voteDurationSeconds": None,
     }
     mongo_details["rooms"].insert_one(new_room)
-    return {"room_id": str(room_id), "code": room_code, "restaurants": restaurants}
+    return {
+        "room_id": str(room_id),
+        "code": room_code,
+        "restaurants": [],
+    }
 
 
 @app.post("/join-room", status_code=200)
@@ -329,7 +464,7 @@ async def join_room(body: JoinRoomBody):
         raise HTTPException(status_code=404, detail="Room not found")
     if room["code"] != code_upper:
         raise HTTPException(status_code=403, detail="Invalid room code")
-    if room["status"] != "waiting":
+    if room["status"] != STATUS_WAITING:
         raise HTTPException(status_code=400, detail="Voting has already started")
 
     oid = room["_id"]
@@ -337,7 +472,7 @@ async def join_room(body: JoinRoomBody):
         {
             "_id": oid,
             "code": code_upper,
-            "status": "waiting",
+            "status": STATUS_WAITING,
             "participants": {"$not": {"$elemMatch": {"username": body.username}}},
             "$expr": {
                 "$lt": [
@@ -364,7 +499,11 @@ async def join_room(body: JoinRoomBody):
             "room_id": rid,
             "code": updated["code"],
             "restaurants": updated["options"],
+            "options": updated["options"],
             "participants": updated["participants"],
+            "hostId": updated["hostId"],
+            "maxCapacity": updated.get("maxCapacity", 20),
+            "status": updated.get("status", STATUS_WAITING),
         }
 
     cur = mongo_details["rooms"].find_one({"_id": oid})
@@ -372,7 +511,7 @@ async def join_room(body: JoinRoomBody):
         raise HTTPException(status_code=404, detail="Room not found")
     if cur["code"] != code_upper:
         raise HTTPException(status_code=403, detail="Invalid room code")
-    if cur["status"] != "waiting":
+    if cur["status"] != STATUS_WAITING:
         raise HTTPException(status_code=400, detail="Voting has already started")
     if body.username in {u["username"] for u in cur["participants"]}:
         raise HTTPException(
@@ -384,6 +523,50 @@ async def join_room(body: JoinRoomBody):
     raise HTTPException(status_code=400, detail="Could not join room")
 
 
+@app.post("/api/rooms/{room_id}/options", status_code=200)
+async def add_room_option(room_id: str, body: AddOptionBody):
+    room = mongo_details["rooms"].find_one({"_id": ObjectId(room_id)})
+    if not room:
+        raise HTTPException(status_code=404, detail="Room not found")
+    if room.get("status") != STATUS_WAITING:
+        raise HTTPException(status_code=400, detail="Suggestions are only allowed before voting")
+    usernames = {p["username"] for p in room.get("participants", [])}
+    if body.userId not in usernames:
+        raise HTTPException(status_code=403, detail="You are not in this room")
+
+    options = room.get("options", [])
+    if len(options) >= 10:
+        raise HTTPException(status_code=400, detail="Maximum 10 suggestions reached")
+
+    new_option = {
+        "id": str(ObjectId()),
+        "name": body.name.strip(),
+        "votes": 0,
+        "source": "cuisine",
+        "cuisineType": body.cuisineType.strip(),
+    }
+    if not new_option["name"]:
+        raise HTTPException(status_code=400, detail="Name is required")
+
+    result = mongo_details["rooms"].update_one(
+        {
+            "_id": ObjectId(room_id),
+            "status": STATUS_WAITING,
+            "$expr": {"$lt": [{"$size": {"$ifNull": ["$options", []]}}, 10]},
+        },
+        {"$push": {"options": new_option}, "$set": {"placesError": None}},
+    )
+    if result.modified_count == 0:
+        raise HTTPException(status_code=400, detail="Could not add suggestion")
+
+    updated = mongo_details["rooms"].find_one({"_id": ObjectId(room_id)})
+    await manager.broadcast(
+        room_id,
+        {"type": "vote_update", "options": updated.get("options", [])},
+    )
+    return {"status": "ok"}
+
+
 @app.post("/api/rooms/{room_id}/start", status_code=200)
 async def start_room_voting(room_id: str, body: StartVotingBody):
     room = mongo_details["rooms"].find_one({"_id": ObjectId(room_id)})
@@ -391,27 +574,38 @@ async def start_room_voting(room_id: str, body: StartVotingBody):
         raise HTTPException(status_code=404, detail="Room not found")
     if room["hostId"] != body.userId:
         raise HTTPException(status_code=403, detail="Only the host can start voting")
-    if room["status"] != "waiting":
+    if room["status"] != STATUS_WAITING:
         raise HTTPException(status_code=400, detail="Voting already started")
 
-    end_time = datetime.now(timezone.utc).timestamp() + body.durationSeconds
+    duration = max(10, min(int(body.durationSeconds), 3600))
+    end_time = datetime.now(timezone.utc).timestamp() + duration
     end_time_iso = datetime.fromtimestamp(end_time, tz=timezone.utc).isoformat()
 
     mongo_details["rooms"].update_one(
         {"_id": ObjectId(room_id)},
-        {"$set": {"status": "voting", "endTime": end_time_iso}},
+        {
+            "$set": {
+                "status": STATUS_CUISINE_VOTING,
+                "endTime": end_time_iso,
+                "voters": [],
+                "hostLatitude": body.latitude,
+                "hostLongitude": body.longitude,
+                "voteDurationSeconds": duration,
+                "placesError": None,
+            }
+        },
     )
-
+    refreshed = mongo_details["rooms"].find_one({"_id": ObjectId(room_id)})
     await manager.broadcast(
         room_id,
         {
             "type": "voting_started",
             "end_time": end_time_iso,
-            "options": room["options"],
+            "options": refreshed.get("options", []) if refreshed else [],
         },
     )
 
-    asyncio.create_task(run_voting_timer(room_id, body.durationSeconds))
+    asyncio.create_task(cuisine_voting_timer(room_id, duration))
     return {"status": "ok", "end_time": end_time_iso}
 
 
@@ -420,20 +614,23 @@ async def vote_room_option(room_id: str, body: VoteBody):
     room = mongo_details["rooms"].find_one({"_id": ObjectId(room_id)})
     if not room:
         raise HTTPException(status_code=404, detail="Room not found")
-    if room.get("status") != "voting":
+    status = room.get("status")
+    if status not in (STATUS_CUISINE_VOTING, STATUS_RESTAURANT_VOTING):
         raise HTTPException(status_code=400, detail="Voting is not active")
 
     username = body.userId
     if username in room.get("voters", []):
         raise HTTPException(status_code=400, detail="You have already voted")
 
-    # Frontend currently sends optionId; in this backend options don't have IDs,
-    # so optionId is treated as option name.
-    option_name = body.optionId
+    usernames = {p["username"] for p in room.get("participants", [])}
+    if username not in usernames:
+        raise HTTPException(status_code=403, detail="You are not in this room")
+
+    option_id = body.optionId
     result = mongo_details["rooms"].update_one(
         {
             "_id": ObjectId(room_id),
-            "options.name": option_name,
+            "options.id": option_id,
             "voters": {"$ne": username},
         },
         {
@@ -454,8 +651,43 @@ async def vote_room_option(room_id: str, body: VoteBody):
             "options": updated_room["options"],
         },
     )
-    ended = await maybe_finish_voting_early(room_id, updated_room)
+
+    ended = False
+    if updated_room.get("status") == STATUS_CUISINE_VOTING:
+        await maybe_finish_cuisine_voting_early(room_id, updated_room)
+    elif updated_room.get("status") == STATUS_RESTAURANT_VOTING:
+        ended = await maybe_finish_restaurant_voting_early(room_id, updated_room)
+
     return {"status": "ok", "ended": ended}
+
+
+@app.post("/api/rooms/{room_id}/restart", status_code=200)
+async def restart_room(room_id: str, body: RestartBody):
+    room = mongo_details["rooms"].find_one({"_id": ObjectId(room_id)})
+    if not room:
+        raise HTTPException(status_code=404, detail="Room not found")
+    if room["hostId"] != body.userId:
+        raise HTTPException(status_code=403, detail="Only the host can restart the session")
+
+    mongo_details["rooms"].update_one(
+        {"_id": ObjectId(room_id)},
+        {
+            "$set": {
+                "status": STATUS_WAITING,
+                "options": [],
+                "voters": [],
+                "winner": None,
+                "endTime": None,
+                "placesError": None,
+                "voteDurationSeconds": None,
+            }
+        },
+    )
+    updated = mongo_details["rooms"].find_one({"_id": ObjectId(room_id)})
+    if not updated:
+        raise HTTPException(status_code=404, detail="Room not found")
+    updated["_id"] = str(updated["_id"])
+    return updated
 
 
 @app.post("/api/rooms/{room_id}/kick", status_code=200)
@@ -538,6 +770,10 @@ async def transfer_room_host(room_id: str, body: TransferHostBody):
     return {"status": "ok", "hostId": updated["hostId"]}
 
 
+def generate_room_code():
+    return "".join(random.choices(string.ascii_uppercase, k=5))
+
+
 # ---------------------------------------------------------------------------
 # WebSocket Route
 # ---------------------------------------------------------------------------
@@ -545,31 +781,6 @@ async def transfer_room_host(room_id: str, body: TransferHostBody):
 
 @app.websocket("/ws/{room_id}")
 async def websocket_endpoint(websocket: WebSocket, room_id: str):
-    """
-    Persistent connection for a single client in a room.
-
-    Expected inbound message shapes
-    ────────────────────────────────
-    { "type": "join",  "username": "Alice" }
-        → broadcasts updated participant list to everyone in the room.
-
-    { "type": "start_voting", "username": "Alice" }
-        → host-only action; transitions room to "voting", starts the 60-second
-          timer, and broadcasts voting_started with end_time to all clients.
-
-    { "type": "vote", "username": "Alice", "restaurant": "Chipotle" }
-        → records Alice's vote (one per user), updates MongoDB, and broadcasts
-          updated tallies to all clients.
-
-    Outbound broadcast message shapes
-    ────────────────────────────────────
-    { "type": "user_joined",    "participants": [...] }
-    { "type": "voting_started", "end_time": <ISO-8601 UTC string>, "options": [...] }
-    { "type": "vote_update",    "options": [...] }
-    { "type": "voting_ended",   "winner": "Chipotle", "options": [...] }
-    { "type": "error",          "message": "..." }   ← sent only to the sender
-    """
-
     await manager.connect(room_id, websocket)
 
     try:
@@ -578,7 +789,6 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str):
             msg_type = data.get("type")
             username = data.get("username", "")
 
-            # ── JOIN ────────────────────────────────────────────────────────
             if msg_type == "join":
                 if not username:
                     await websocket.send_json(
@@ -608,7 +818,6 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str):
                     },
                 )
 
-            # ── START VOTING ────────────────────────────────────────────────
             elif msg_type == "start_voting":
                 room = mongo_details["rooms"].find_one({"_id": ObjectId(room_id)})
                 if not room:
@@ -621,14 +830,26 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str):
                         {"type": "error", "message": "Only the host can start voting"}
                     )
                     continue
-                if room["status"] != "waiting":
+                if room["status"] != STATUS_WAITING:
                     await websocket.send_json(
                         {"type": "error", "message": "Voting already started"}
                     )
                     continue
 
+                lat = room.get("hostLatitude")
+                lng = room.get("hostLongitude")
+                if lat is None or lng is None:
+                    await websocket.send_json(
+                        {
+                            "type": "error",
+                            "message": "Host location missing; start voting from the app (HTTP) instead.",
+                        }
+                    )
+                    continue
+
+                duration = int(room.get("voteDurationSeconds") or VOTE_DURATION_SECONDS)
                 end_time = (
-                    datetime.now(timezone.utc).timestamp() + VOTE_DURATION_SECONDS
+                    datetime.now(timezone.utc).timestamp() + duration
                 )
                 end_time_iso = datetime.fromtimestamp(
                     end_time, tz=timezone.utc
@@ -636,28 +857,34 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str):
 
                 mongo_details["rooms"].update_one(
                     {"_id": ObjectId(room_id)},
-                    {"$set": {"status": "voting", "endTime": end_time_iso}},
+                    {
+                        "$set": {
+                            "status": STATUS_CUISINE_VOTING,
+                            "endTime": end_time_iso,
+                            "voters": [],
+                            "voteDurationSeconds": duration,
+                            "placesError": None,
+                        }
+                    },
                 )
-
+                refreshed = mongo_details["rooms"].find_one(
+                    {"_id": ObjectId(room_id)}
+                )
                 await manager.broadcast(
                     room_id,
                     {
                         "type": "voting_started",
                         "end_time": end_time_iso,
-                        "options": room["options"],
+                        "options": refreshed.get("options", []) if refreshed else [],
                     },
                 )
+                asyncio.create_task(cuisine_voting_timer(room_id, duration))
 
-                # Fire-and-forget timer — runs concurrently without blocking
-                # any other messages.
-                asyncio.create_task(run_voting_timer(room_id, VOTE_DURATION_SECONDS))
-
-            # ── VOTE ────────────────────────────────────────────────────────
             elif msg_type == "vote":
-                restaurant_name = data.get("restaurant")
-                if not restaurant_name:
+                option_key = data.get("optionId") or data.get("restaurant")
+                if not option_key:
                     await websocket.send_json(
-                        {"type": "error", "message": "Missing restaurant field"}
+                        {"type": "error", "message": "Missing optionId or restaurant"}
                     )
                     continue
 
@@ -667,7 +894,8 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str):
                         {"type": "error", "message": "Room not found"}
                     )
                     continue
-                if room["status"] != "voting":
+                st = room.get("status")
+                if st not in (STATUS_CUISINE_VOTING, STATUS_RESTAURANT_VOTING):
                     await websocket.send_json(
                         {"type": "error", "message": "Voting is not active"}
                     )
@@ -678,17 +906,14 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str):
                     )
                     continue
 
-                # Atomically increment the vote and record the voter.
                 result = mongo_details["rooms"].update_one(
                     {
                         "_id": ObjectId(room_id),
-                        "options.name": restaurant_name,
-                        "voters": {"$ne": username},  # extra guard against duplicates
+                        "status": st,
+                        "options.id": option_key,
+                        "voters": {"$ne": username},
                     },
-                    {
-                        "$inc": {"options.$.votes": 1},
-                        "$push": {"voters": username},
-                    },
+                    {"$inc": {"options.$.votes": 1}, "$push": {"voters": username}},
                 )
                 if result.modified_count == 0:
                     await websocket.send_json(
@@ -711,17 +936,15 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str):
                         "options": updated_room["options"],
                     },
                 )
-                await maybe_finish_voting_early(room_id, updated_room)
-
-            # ── Restart (Optional) ──────────────────────────────────────────
-            # TODO : complete this
-
+                if updated_room.get("status") == STATUS_CUISINE_VOTING:
+                    await maybe_finish_cuisine_voting_early(room_id, updated_room)
+                elif updated_room.get("status") == STATUS_RESTAURANT_VOTING:
+                    await maybe_finish_restaurant_voting_early(room_id, updated_room)
 
             else:
                 await websocket.send_json(
                     {"type": "error", "message": f"Unknown message type: {msg_type}"}
                 )
-
 
     except WebSocketDisconnect:
         uname = manager.disconnect(room_id, websocket)
@@ -729,7 +952,7 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str):
             manager.maybe_promote_host_after_disconnect(room_id, uname)
         )
         logger.info("Client disconnected cleanly  room=%s", room_id)
-    except Exception as e:
+    except Exception:
         logger.exception("Unexpected WS error  room=%s", room_id)
         uname = manager.disconnect(room_id, websocket)
         asyncio.create_task(

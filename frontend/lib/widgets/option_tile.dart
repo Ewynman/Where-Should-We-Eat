@@ -1,5 +1,7 @@
 import 'package:flutter/material.dart';
 
+import '../api_client.dart';
+import '../maps_launch.dart';
 import '../models.dart';
 
 class OptionTile extends StatelessWidget {
@@ -186,7 +188,8 @@ class OptionTile extends StatelessWidget {
                       fit: StackFit.expand,
                       children: [
                         _RestaurantImage(
-                          imageUrl: option.imageUrl,
+                          imageUrl:
+                              AppConfig.resolveMediaUrl(option.imageUrl),
                           title: option.name,
                           accent: accent,
                         ),
@@ -196,16 +199,6 @@ class OptionTile extends StatelessWidget {
                           child: _BadgeChip(
                             text: option.cuisineType ?? 'Cuisine pending',
                             icon: Icons.restaurant_menu_rounded,
-                          ),
-                        ),
-                        Positioned(
-                          top: 10,
-                          right: 10,
-                          child: _BadgeChip(
-                            text: option.rating == null
-                                ? 'N/A'
-                                : option.rating!.toStringAsFixed(1),
-                            icon: Icons.star_rounded,
                           ),
                         ),
                       ],
@@ -250,6 +243,10 @@ class OptionTile extends StatelessWidget {
                             ),
                           ],
                         ),
+                        if (option.rating != null) ...[
+                          const SizedBox(height: 6),
+                          StarRatingRow(rating: option.rating!),
+                        ],
                         if (option.address != null) ...[
                           const SizedBox(height: 6),
                           Text(
@@ -261,8 +258,48 @@ class OptionTile extends StatelessWidget {
                           ),
                         ],
                         const SizedBox(height: 10),
+                        Wrap(
+                          spacing: 4,
+                          runSpacing: 4,
+                          children: [
+                            if (option.mapsLaunchUri != null)
+                              TextButton.icon(
+                                onPressed: () =>
+                                    launchOptionInMaps(option),
+                                icon: const Icon(
+                                  Icons.map_rounded,
+                                  size: 18,
+                                  color: Color(0xFF5F3A47),
+                                ),
+                                label: const Text('Maps'),
+                                style: TextButton.styleFrom(
+                                  foregroundColor: const Color(0xFF5F3A47),
+                                  visualDensity: VisualDensity.compact,
+                                  tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                                ),
+                              ),
+                            if (option.websiteUri != null &&
+                                option.websiteUri!.trim().isNotEmpty)
+                              TextButton.icon(
+                                onPressed: () =>
+                                    launchWebsite(option.websiteUri),
+                                icon: const Icon(
+                                  Icons.restaurant_menu_rounded,
+                                  size: 18,
+                                  color: Color(0xFF5F3A47),
+                                ),
+                                label: const Text('Menu / website'),
+                                style: TextButton.styleFrom(
+                                  foregroundColor: const Color(0xFF5F3A47),
+                                  visualDensity: VisualDensity.compact,
+                                  tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                                ),
+                              ),
+                          ],
+                        ),
+                        const SizedBox(height: 6),
                         const Text(
-                          'Menu highlights',
+                          'Details',
                           style: TextStyle(
                             fontSize: 12,
                             color: Color(0xFF7D4C5F),
@@ -270,11 +307,23 @@ class OptionTile extends StatelessWidget {
                           ),
                         ),
                         const SizedBox(height: 7),
-                        if (highlights.isEmpty)
+                        if (highlights.isEmpty &&
+                            (option.websiteUri == null ||
+                                option.websiteUri!.trim().isEmpty))
                           const Text(
-                            'No highlights yet - backend will provide these soon.',
+                            'No extra details from listings.',
                             style: TextStyle(
                               color: Color(0xFF8A6272),
+                              fontSize: 13,
+                            ),
+                          )
+                        else if (highlights.isEmpty)
+                          Text(
+                            'Open Menu / website above when the venue publishes one.',
+                            style: TextStyle(
+                              color: const Color(0xFF8A6272).withValues(
+                                alpha: 0.9,
+                              ),
                               fontSize: 13,
                             ),
                           )
@@ -314,6 +363,33 @@ class OptionTile extends StatelessWidget {
           ),
         ),
       ),
+    );
+  }
+}
+
+class StarRatingRow extends StatelessWidget {
+  const StarRatingRow({super.key, required this.rating});
+
+  final double rating;
+
+  @override
+  Widget build(BuildContext context) {
+    const starColor = Color(0xFFE6A000);
+    const emptyColor = Color(0xFFDCCEEB);
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: List.generate(5, (i) {
+        final delta = rating - i;
+        IconData icon;
+        if (delta >= 0.85) {
+          icon = Icons.star_rounded;
+        } else if (delta >= 0.35) {
+          icon = Icons.star_half_rounded;
+        } else {
+          icon = Icons.star_border_rounded;
+        }
+        return Icon(icon, size: 22, color: delta > 0 ? starColor : emptyColor);
+      }),
     );
   }
 }

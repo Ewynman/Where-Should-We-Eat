@@ -55,6 +55,9 @@ class OptionModel {
     this.rating,
     this.menuHighlights = const [],
     this.source = OptionSource.cuisine,
+    this.googleMapsUri,
+    this.websiteUri,
+    this.placeId,
   });
 
   final String id;
@@ -67,8 +70,32 @@ class OptionModel {
   final double? rating;
   final List<String> menuHighlights;
   final OptionSource source;
+  final String? googleMapsUri;
+  final String? websiteUri;
+  final String? placeId;
 
   bool get isRestaurant => source == OptionSource.restaurant;
+
+  /// Prefer Google Maps deep link, then place id search, then name + address.
+  Uri? get mapsLaunchUri {
+    final g = googleMapsUri?.trim();
+    if (g != null && g.isNotEmpty) {
+      final u = Uri.tryParse(g);
+      if (u != null) return u;
+    }
+    final pid = placeId?.trim();
+    if (pid != null && pid.isNotEmpty) {
+      return Uri.parse(
+        'https://www.google.com/maps/search/?api=1&query_place_id=${Uri.encodeComponent(pid)}',
+      );
+    }
+    final q = [name, if (address != null && address!.trim().isNotEmpty) address!.trim()]
+        .join(' ');
+    if (q.trim().isEmpty) return null;
+    return Uri.parse(
+      'https://www.google.com/maps/search/?api=1&query=${Uri.encodeComponent(q.trim())}',
+    );
+  }
 
   factory OptionModel.fromJson(Map<String, dynamic> json) {
     final ratingRaw = json['rating'] ?? json['avgRating'];
@@ -96,6 +123,10 @@ class OptionModel {
           ? highlightsRaw.map((item) => item.toString()).toList()
           : const [],
       source: source,
+      googleMapsUri:
+          (json['googleMapsUri'] ?? json['google_maps_uri']) as String?,
+      websiteUri: (json['websiteUri'] ?? json['website_uri']) as String?,
+      placeId: (json['placeId'] ?? json['place_id']) as String?,
     );
   }
 }
@@ -110,6 +141,7 @@ class RoomModel {
     required this.endTime,
     required this.options,
     required this.participants,
+    this.placesError,
   });
 
   final String id;
@@ -120,6 +152,7 @@ class RoomModel {
   final DateTime? endTime;
   final List<OptionModel> options;
   final List<RoomParticipant> participants;
+  final String? placesError;
 
   factory RoomModel.fromJson(Map<String, dynamic> json) {
     final statusRaw = (json['status'] as String? ?? 'waiting').toLowerCase();
@@ -147,6 +180,7 @@ class RoomModel {
       participants: (json['participants'] as List<dynamic>? ?? [])
           .map((item) => RoomParticipant.fromJson(item as Map<String, dynamic>))
           .toList(),
+      placesError: (json['placesError'] ?? json['places_error']) as String?,
     );
   }
 }

@@ -55,7 +55,9 @@ class RoomRealtimeService {
             type == 'user_joined' ||
             type == 'vote_update' ||
             type == 'voting_started' ||
-            type == 'voting_ended') {
+            type == 'voting_ended' ||
+            type == 'fetching_started' ||
+            type == 'fetching_failed') {
           onServerSignalRefresh();
         }
       },

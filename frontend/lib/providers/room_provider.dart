@@ -1,40 +1,11 @@
-import 'dart:convert';
-
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
-import 'package:http/http.dart' as http;
 
 import '../api_client.dart';
 import '../constants/cuisine_constants.dart';
 import '../constants/suggestion_validation.dart';
 import '../models.dart';
 import 'session_provider.dart';
-
-// #region agent log
-void _debugLog(String message, Map<String, dynamic> data) {
-  final payload = {
-    'sessionId': 'f5120d',
-    'location': 'room_provider.dart',
-    'message': message,
-    'data': data,
-    'timestamp': DateTime.now().millisecondsSinceEpoch,
-  };
-  Future<void>(() async {
-    try {
-      await http.post(
-        Uri.parse(
-          'http://127.0.0.1:7542/ingest/e00f7f0d-6c0b-4cee-91cd-bbfb1a502ff5',
-        ),
-        headers: {
-          'Content-Type': 'application/json',
-          'X-Debug-Session-Id': 'f5120d',
-        },
-        body: jsonEncode(payload),
-      );
-    } catch (_) {}
-  });
-}
-// #endregion
 
 /// Room state for a given room code. Refreshes on first watch; use [roomNotifierProvider] for actions.
 final roomProvider =
@@ -99,9 +70,6 @@ class RoomNotifier extends FamilyAsyncNotifier<RoomModel?, String> {
 
   Future<void> vote(String optionId) async {
     final userId = await _userId();
-    // #region agent log
-    _debugLog('vote_provider', {'optionId': optionId, 'userId': userId, 'userId_is_null': userId == null});
-    // #endregion
     if (userId == null) {
       throw Exception('Session not ready. Please wait or rejoin the room.');
     }
@@ -109,15 +77,19 @@ class RoomNotifier extends FamilyAsyncNotifier<RoomModel?, String> {
     await refresh();
   }
 
-  Future<void> startVoting({double lat = 37.7749, double lng = -122.4194}) async {
+  Future<void> startVoting({
+    required double latitude,
+    required double longitude,
+    int durationSeconds = 60,
+  }) async {
     final userId = await _userId();
     if (userId == null) return;
     await ApiClient.startTimer(
       roomCode: _roomCode,
       userId: userId,
-      latitude: lat,
-      longitude: lng,
-      durationSeconds: 60,
+      latitude: latitude,
+      longitude: longitude,
+      durationSeconds: durationSeconds,
     );
     await refresh();
   }

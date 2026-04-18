@@ -173,16 +173,14 @@ class WaitingSection extends StatelessWidget {
             ),
           ),
         if (isHost)
-          AppSectionCard(
-            backgroundColor: const Color(0xFFFFBDBD),
-            borderColor: const Color(0xFFFFA4A4),
-            child: AppButton(
-              onPressed: (room.options.length < 2 || startingVote)
-                  ? null
-                  : onStartVoting,
-              loading: startingVote,
-              text: 'Start voting',
-            ),
+          AppButton(
+            onPressed: (room.options.length < 2 || startingVote)
+                ? null
+                : onStartVoting,
+            loading: startingVote,
+            text: 'Start voting',
+            backgroundColor: const Color(0xFFFF7FA3),
+            foregroundColor: const Color(0xFF4A2E3A),
           ),
       ],
     );
