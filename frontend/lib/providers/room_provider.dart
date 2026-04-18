@@ -128,4 +128,26 @@ class RoomNotifier extends FamilyAsyncNotifier<RoomModel?, String> {
     final room = await ApiClient.restartRoom(_roomCode, userId);
     state = AsyncData(room);
   }
+
+  Future<void> kickParticipant(String targetUsername) async {
+    final userId = await _userId();
+    if (userId == null) return;
+    await ApiClient.kickParticipant(
+      roomCode: _roomCode,
+      userId: userId,
+      targetUsername: targetUsername,
+    );
+    await refresh();
+  }
+
+  Future<void> transferHost(String newHostUsername) async {
+    final userId = await _userId();
+    if (userId == null) return;
+    await ApiClient.transferHost(
+      roomCode: _roomCode,
+      userId: userId,
+      newHostUsername: newHostUsername,
+    );
+    await refresh();
+  }
 }

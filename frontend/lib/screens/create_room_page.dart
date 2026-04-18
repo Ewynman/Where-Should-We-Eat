@@ -22,6 +22,7 @@ class _CreateRoomPageState extends State<CreateRoomPage> {
   final _nameController = TextEditingController();
   bool _loading = false;
   String _error = '';
+  double _maxCapacity = 10;
 
   @override
   void dispose() {
@@ -68,6 +69,7 @@ class _CreateRoomPageState extends State<CreateRoomPage> {
         _nameController.text.trim(),
         latitude: coords.latitude,
         longitude: coords.longitude,
+        maxCapacity: _maxCapacity.round(),
       );
       await UserSession.saveUser(result.user);
       if (!mounted) return;
@@ -157,6 +159,30 @@ class _CreateRoomPageState extends State<CreateRoomPage> {
                     maxLength: 32,
                     hintText: 'Pick Something Funny lol',
                     counterText: '',
+                  ),
+                  const SizedBox(height: 18),
+                  const Text(
+                    'Max participants',
+                    style: TextStyle(
+                      fontWeight: FontWeight.w700,
+                      color: AppColors.textSecondary,
+                    ),
+                  ),
+                  const SizedBox(height: 6),
+                  Text(
+                    '${_maxCapacity.round()} people (including you)',
+                    style: const TextStyle(
+                      fontWeight: FontWeight.w600,
+                      color: Color(0xFF5F3A47),
+                    ),
+                  ),
+                  Slider(
+                    value: _maxCapacity,
+                    min: 2,
+                    max: 20,
+                    divisions: 18,
+                    label: '${_maxCapacity.round()}',
+                    onChanged: (v) => setState(() => _maxCapacity = v),
                   ),
                   if (_error.isNotEmpty) ...[
                     const SizedBox(height: 10),

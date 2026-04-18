@@ -12,7 +12,7 @@ import '../components/layout/app_page_shell.dart';
 import '../models.dart';
 import '../providers/room_provider.dart';
 import '../providers/session_provider.dart';
-import '../providers/socket_provider.dart';
+import '../room_realtime_service.dart';
 import '../widgets/cuisine_voting_section.dart';
 import '../widgets/error_banner.dart';
 import '../widgets/fetching_restaurants_section.dart';
@@ -58,8 +58,10 @@ class RoomPage extends ConsumerStatefulWidget {
 
 class _RoomPageState extends ConsumerState<RoomPage> {
   final _optionController = TextEditingController();
+  final _roomRealtime = RoomRealtimeService();
   Timer? _pollingTimer;
   String _error = '';
+  bool _realtimeConnected = false;
   String? _votedOptionId;
   String? _highlightedOptionId;
   Set<String> _knownOptionIds = {};
@@ -70,6 +72,7 @@ class _RoomPageState extends ConsumerState<RoomPage> {
   RoomStatus? _lastPhaseOverlayShown;
   /// Prevents clearing _votedOptionId more than once per restaurant phase.
   bool _clearedVoteForRestaurantPhase = false;
+  ProviderSubscription<AsyncValue<String?>>? _sessionSub;
 
   static const _phaseOverlayStatuses = [
     RoomStatus.cuisineVoting,
@@ -81,22 +84,139 @@ class _RoomPageState extends ConsumerState<RoomPage> {
   @override
   void initState() {
     super.initState();
-    final socket = ref.read(socketServiceProvider);
-    socket.connect(
-      roomCode: widget.roomCode,
-      onRoomUpdate: (room) {
-        roomNotifier(ref, widget.roomCode).applyRoomUpdate(room);
-        if (mounted) _applyRoomUpdate(room);
-      },
-    );
+    _sessionSub = ref.listenManual(sessionUserIdProvider, (prev, next) {
+      final uid = next.valueOrNull;
+      if (uid == null || uid.isEmpty || _realtimeConnected) return;
+      _realtimeConnected = true;
+      _roomRealtime.connect(
+        roomId: widget.roomCode,
+        username: uid,
+        onKickedByHost: _onKickedByHost,
+        onServerSignalRefresh: () {
+          unawaited(roomNotifier(ref, widget.roomCode).refresh());
+        },
+      );
+    }, fireImmediately: true);
   }
 
   @override
   void dispose() {
-    ref.read(socketServiceProvider).leave(widget.roomCode);
+    _sessionSub?.close();
+    _roomRealtime.disconnect();
     _pollingTimer?.cancel();
     _optionController.dispose();
     super.dispose();
+  }
+
+  void _onKickedByHost(String message) {
+    if (!mounted) return;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      showDialog<void>(
+        context: context,
+        barrierDismissible: false,
+        builder: (ctx) => AlertDialog(
+          title: const Text('Removed from room'),
+          content: Text(message),
+          actions: [
+            TextButton(
+              onPressed: () {
+                Navigator.of(ctx).pop();
+                Navigator.of(context).maybePop();
+              },
+              child: const Text('OK'),
+            ),
+          ],
+        ),
+      );
+    });
+  }
+
+  Future<void> _hostKick(String username) async {
+    try {
+      await roomNotifier(ref, widget.roomCode).kickParticipant(username);
+    } catch (e) {
+      if (mounted) {
+        setState(() => _error = e.toString().replaceFirst('Exception: ', ''));
+      }
+    }
+  }
+
+  Future<void> _hostTransfer(String username) async {
+    try {
+      await roomNotifier(ref, widget.roomCode).transferHost(username);
+    } catch (e) {
+      if (mounted) {
+        setState(() => _error = e.toString().replaceFirst('Exception: ', ''));
+      }
+    }
+  }
+
+  void _showParticipantsSheet(RoomModel room, bool isHost, String? userId) {
+    showModalBottomSheet<void>(
+      context: context,
+      builder: (sheetCtx) => SafeArea(
+        child: ListView(
+          shrinkWrap: true,
+          children: [
+            const ListTile(
+              title: Text(
+                'People in this room',
+                style: TextStyle(fontWeight: FontWeight.w700),
+              ),
+            ),
+            for (final p in room.participants)
+              ListTile(
+                title: Text(p.name),
+                subtitle: p.name == room.hostId
+                    ? const Text('Host')
+                    : null,
+                trailing: isHost && p.name != userId
+                    ? Wrap(
+                        alignment: WrapAlignment.end,
+                        children: [
+                          TextButton(
+                            onPressed: () async {
+                              try {
+                                await roomNotifier(ref, widget.roomCode)
+                                    .kickParticipant(p.name);
+                                if (sheetCtx.mounted) {
+                                  Navigator.of(sheetCtx).pop();
+                                }
+                              } catch (e) {
+                                if (mounted) {
+                                  setState(() => _error =
+                                      e.toString().replaceFirst('Exception: ', ''));
+                                }
+                              }
+                            },
+                            child: const Text('Kick'),
+                          ),
+                          TextButton(
+                            onPressed: () async {
+                              try {
+                                await roomNotifier(ref, widget.roomCode)
+                                    .transferHost(p.name);
+                                if (sheetCtx.mounted) {
+                                  Navigator.of(sheetCtx).pop();
+                                }
+                              } catch (e) {
+                                if (mounted) {
+                                  setState(() => _error =
+                                      e.toString().replaceFirst('Exception: ', ''));
+                                }
+                              }
+                            },
+                            child: const Text('Make host'),
+                          ),
+                        ],
+                      )
+                    : null,
+              ),
+          ],
+        ),
+      ),
+    );
   }
 
   void _configurePolling(RoomModel? room) {
@@ -297,6 +417,13 @@ class _RoomPageState extends ConsumerState<RoomPage> {
             backgroundColor: appBarColor,
             title: Text('Room ${room.code}'),
             actions: [
+              if (isHost)
+                IconButton(
+                  tooltip: 'People',
+                  icon: const Icon(Icons.group_outlined),
+                  onPressed: () =>
+                      _showParticipantsSheet(room, isHost, userId),
+                ),
               Padding(
                 padding: const EdgeInsets.only(right: 12),
                 child: AppStatusChip(label: room.status.displayName),
@@ -373,6 +500,8 @@ class _RoomPageState extends ConsumerState<RoomPage> {
         startingVote: _startingVote,
         onAddOption: _addOption,
         onStartVoting: _startVoting,
+        onKickParticipant: isHost ? _hostKick : null,
+        onTransferHost: isHost ? _hostTransfer : null,
       );
     }
     if (room.status == RoomStatus.cuisineVoting || room.status == RoomStatus.voting) {

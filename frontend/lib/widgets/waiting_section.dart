@@ -20,6 +20,8 @@ class WaitingSection extends StatelessWidget {
     required this.startingVote,
     required this.onAddOption,
     required this.onStartVoting,
+    this.onKickParticipant,
+    this.onTransferHost,
   });
 
   final RoomModel room;
@@ -31,11 +33,15 @@ class WaitingSection extends StatelessWidget {
   final bool startingVote;
   final VoidCallback onAddOption;
   final VoidCallback onStartVoting;
+  final Future<void> Function(String username)? onKickParticipant;
+  final Future<void> Function(String username)? onTransferHost;
 
   @override
   Widget build(BuildContext context) {
     final participants = room.participants;
     final atLimit = room.options.length >= 10;
+    final showModeration =
+        isHost && onKickParticipant != null && onTransferHost != null;
 
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -51,7 +57,7 @@ class WaitingSection extends StatelessWidget {
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               Text(
-                '${participants.length} in the room',
+                '${participants.length} / ${room.maxCapacity} in the room',
                 style: const TextStyle(
                   fontSize: 22,
                   fontWeight: FontWeight.w800,
@@ -59,19 +65,35 @@ class WaitingSection extends StatelessWidget {
                 ),
               ),
               const SizedBox(height: 8),
-              Wrap(
-                spacing: 8,
-                runSpacing: 8,
-                children: participants
-                    .map(
-                      (person) => AppAvatarChip(
-                        name: person.name,
-                        isHost: person.id == room.hostId,
-                        isYou: person.id == currentUserId,
+              ...participants.map((person) {
+                final isSelf = person.name == currentUserId;
+                final canModerate = showModeration && !isSelf;
+                return Padding(
+                  padding: const EdgeInsets.only(bottom: 8),
+                  child: Row(
+                    crossAxisAlignment: CrossAxisAlignment.center,
+                    children: [
+                      Expanded(
+                        child: AppAvatarChip(
+                          name: person.name,
+                          isHost: person.name == room.hostId,
+                          isYou: isSelf,
+                        ),
                       ),
-                    )
-                    .toList(),
-              ),
+                      if (canModerate) ...[
+                        TextButton(
+                          onPressed: () => onKickParticipant!(person.name),
+                          child: const Text('Kick'),
+                        ),
+                        TextButton(
+                          onPressed: () => onTransferHost!(person.name),
+                          child: const Text('Make host'),
+                        ),
+                      ],
+                    ],
+                  ),
+                );
+              }),
             ],
           ),
         ),

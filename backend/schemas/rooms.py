@@ -1,10 +1,11 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class CreateRoomBody(BaseModel):
     host_name: str
     latitude: float
     longitude: float
+    max_capacity: int = Field(default=10, ge=2, le=20)
 
 
 class JoinRoomBody(BaseModel):
@@ -34,3 +35,13 @@ class StartVotingBody(BaseModel):
     durationSeconds: int = 60
     latitude: float
     longitude: float
+
+
+class KickBody(BaseModel):
+    userId: str
+    targetUsername: str
+
+
+class TransferHostBody(BaseModel):
+    userId: str
+    newHostUsername: str
