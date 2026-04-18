@@ -1,6 +1,8 @@
 import 'package:flutter/material.dart';
 
+import '../maps_launch.dart';
 import '../models.dart';
+import 'option_tile.dart' show StarRatingRow;
 
 class WinnerCard extends StatelessWidget {
   const WinnerCard({super.key, required this.option});
@@ -37,12 +39,13 @@ class WinnerCard extends StatelessWidget {
             children: [
               if (option.cuisineType != null)
                 _chip(Icons.restaurant_menu_rounded, option.cuisineType!),
-              if (option.rating != null)
-                _chip(Icons.star_rounded, option.rating!.toStringAsFixed(1)),
             ],
           ),
-          if (option.cuisineType != null || option.rating != null)
+          if (option.cuisineType != null) const SizedBox(height: 8),
+          if (option.rating != null) ...[
+            StarRatingRow(rating: option.rating!),
             const SizedBox(height: 8),
+          ],
           Text(
             option.name,
             style: const TextStyle(
@@ -62,6 +65,37 @@ class WinnerCard extends StatelessWidget {
           Text(
             '${option.voteCount} votes',
             style: const TextStyle(color: Color(0xFF4A2E3A)),
+          ),
+          const SizedBox(height: 14),
+          Wrap(
+            spacing: 8,
+            runSpacing: 8,
+            children: [
+              if (option.mapsLaunchUri != null)
+                FilledButton.icon(
+                  onPressed: () async {
+                    await launchOptionInMaps(option);
+                  },
+                  icon: const Icon(Icons.map_rounded),
+                  label: const Text('Open in Maps'),
+                  style: FilledButton.styleFrom(
+                    backgroundColor: const Color(0xFF4A2E3A),
+                    foregroundColor: const Color(0xFFFFF4E8),
+                  ),
+                ),
+              if (option.websiteUri != null &&
+                  option.websiteUri!.trim().isNotEmpty)
+                OutlinedButton.icon(
+                  onPressed: () async {
+                    await launchWebsite(option.websiteUri);
+                  },
+                  icon: const Icon(Icons.restaurant_menu_rounded),
+                  label: const Text('Menu / website'),
+                  style: OutlinedButton.styleFrom(
+                    foregroundColor: const Color(0xFF4A2E3A),
+                  ),
+                ),
+            ],
           ),
         ],
       ),

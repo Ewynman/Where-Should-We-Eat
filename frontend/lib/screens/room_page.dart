@@ -1,11 +1,10 @@
 import 'dart:async';
-import 'dart:convert';
 import 'dart:math';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
-import 'package:http/http.dart' as http;
+import 'package:geolocator/geolocator.dart';
 
 import '../components/chips/app_status_chip.dart';
 import '../components/layout/app_page_shell.dart';
@@ -20,32 +19,6 @@ import '../widgets/phase_transition_overlay.dart';
 import '../widgets/results_section.dart';
 import '../widgets/voting_section.dart';
 import '../widgets/waiting_section.dart';
-
-// #region agent log
-void _debugLog(String message, Map<String, dynamic> data) {
-  final payload = {
-    'sessionId': 'f5120d',
-    'location': 'room_page.dart',
-    'message': message,
-    'data': data,
-    'timestamp': DateTime.now().millisecondsSinceEpoch,
-  };
-  unawaited(() async {
-    try {
-      await http.post(
-        Uri.parse(
-          'http://127.0.0.1:7542/ingest/e00f7f0d-6c0b-4cee-91cd-bbfb1a502ff5',
-        ),
-        headers: {
-          'Content-Type': 'application/json',
-          'X-Debug-Session-Id': 'f5120d',
-        },
-        body: jsonEncode(payload),
-      );
-    } catch (_) {}
-  }());
-}
-// #endregion
 
 class RoomPage extends ConsumerStatefulWidget {
   const RoomPage({super.key, required this.roomCode});
@@ -80,6 +53,32 @@ class _RoomPageState extends ConsumerState<RoomPage> {
     RoomStatus.fetchingRestaurants,
     RoomStatus.restaurantVoting,
   ];
+
+  static const _fallbackLat = 37.7749;
+  static const _fallbackLng = -122.4194;
+
+  Future<({double latitude, double longitude})> _resolveLocation() async {
+    try {
+      final serviceEnabled = await Geolocator.isLocationServiceEnabled();
+      if (!serviceEnabled) {
+        return (latitude: _fallbackLat, longitude: _fallbackLng);
+      }
+      var permission = await Geolocator.checkPermission();
+      if (permission == LocationPermission.denied) {
+        permission = await Geolocator.requestPermission();
+      }
+      if (permission == LocationPermission.denied ||
+          permission == LocationPermission.deniedForever) {
+        return (latitude: _fallbackLat, longitude: _fallbackLng);
+      }
+      final pos = await Geolocator.getCurrentPosition(
+        desiredAccuracy: LocationAccuracy.medium,
+      );
+      return (latitude: pos.latitude, longitude: pos.longitude);
+    } catch (_) {
+      return (latitude: _fallbackLat, longitude: _fallbackLng);
+    }
+  }
 
   @override
   void initState() {
@@ -268,17 +267,11 @@ class _RoomPageState extends ConsumerState<RoomPage> {
   }
 
   Future<void> _vote(String optionId) async {
-    // #region agent log
-    _debugLog('room_page_vote', {'optionId': optionId, 'votedOptionId_before': _votedOptionId});
-    // #endregion
     if (_votedOptionId != null) return;
     setState(() => _votedOptionId = optionId);
     try {
       await roomNotifier(ref, widget.roomCode).vote(optionId);
     } catch (e) {
-      // #region agent log
-      _debugLog('room_page_vote_catch', {'optionId': optionId, 'error': e.toString()});
-      // #endregion
       if (mounted) {
         setState(() {
           _votedOptionId = null;
@@ -293,13 +286,18 @@ class _RoomPageState extends ConsumerState<RoomPage> {
 
   Future<void> _startVoting() async {
     if (_startingVote) return;
-    setState(() {
-      _startingVote = true;
-      _phaseOverlayStatus = RoomStatus.cuisineVoting;
-      _lastPhaseOverlayShown = RoomStatus.cuisineVoting;
-    });
+    setState(() => _startingVote = true);
     try {
-      await roomNotifier(ref, widget.roomCode).startVoting();
+      final coords = await _resolveLocation();
+      await roomNotifier(ref, widget.roomCode).startVoting(
+        latitude: coords.latitude,
+        longitude: coords.longitude,
+      );
+      if (!mounted) return;
+      setState(() {
+        _phaseOverlayStatus = RoomStatus.cuisineVoting;
+        _lastPhaseOverlayShown = RoomStatus.cuisineVoting;
+      });
     } catch (e) {
       if (mounted) {
         setState(() =>
@@ -440,6 +438,12 @@ class _RoomPageState extends ConsumerState<RoomPage> {
                   child: ListView(
                     children: [
                       if (_error.isNotEmpty) ErrorBanner(message: _error),
+                      if (room.placesError != null &&
+                          room.placesError!.trim().isNotEmpty)
+                        ErrorBanner(
+                          message:
+                              'Restaurant search: ${room.placesError!.trim()}',
+                        ),
                       AnimatedSwitcher(
                         duration: const Duration(milliseconds: 260),
                         switchInCurve: Curves.easeOutCubic,

@@ -13,6 +13,14 @@ class AppConfig {
     'WS_BASE_URL',
     defaultValue: apiBase,
   );
+
+  /// Backend may return relative image paths (e.g. proxied Google photos).
+  static String? resolveMediaUrl(String? raw) {
+    if (raw == null || raw.isEmpty) return null;
+    if (raw.startsWith('http://') || raw.startsWith('https://')) return raw;
+    if (raw.startsWith('/')) return '$apiBase$raw';
+    return raw;
+  }
 }
 
 class ApiClient {
@@ -83,10 +91,10 @@ class ApiClient {
       room: RoomModel.fromJson({
         '_id': map['room_id'],
         'code': map['code'],
-        'hostId': '',
-        'maxCapacity': 20,
-        'status': 'waiting',
-        'options': map['restaurants'] ?? [],
+        'hostId': map['hostId'] ?? '',
+        'maxCapacity': map['maxCapacity'] ?? 20,
+        'status': map['status'] ?? 'waiting',
+        'options': map['restaurants'] ?? map['options'] ?? [],
         'participants': map['participants'] ?? [],
       }),
       user: UserModel(id: name, name: name),
