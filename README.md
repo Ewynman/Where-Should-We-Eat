@@ -73,6 +73,8 @@ Where-Should-We-Eat/
 
 ## Docker (3 containers)
 
+**Docker must be running.** If you use [Colima](https://github.com/abiosoft/colima), start it first (`colima start`). If the error mentions `colima/.../docker.sock` and “no such file”, Colima is stopped. With Docker Desktop instead, ensure the app is running and `docker context use default` (or your Desktop context) if you previously switched to Colima.
+
 This repo can run as 3 services:
 - `frontend` (Flutter web + Nginx) at [http://localhost:3000](http://localhost:3000)
 - `backend` (FastAPI) at [http://localhost:8080](http://localhost:8080)

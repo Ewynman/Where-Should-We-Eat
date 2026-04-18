@@ -105,6 +105,7 @@ class RoomModel {
     required this.id,
     required this.code,
     required this.hostId,
+    required this.maxCapacity,
     required this.status,
     required this.endTime,
     required this.options,
@@ -114,6 +115,7 @@ class RoomModel {
   final String id;
   final String code;
   final String hostId;
+  final int maxCapacity;
   final RoomStatus status;
   final DateTime? endTime;
   final List<OptionModel> options;
@@ -134,6 +136,7 @@ class RoomModel {
       id: (json['id'] ?? json['_id'] ?? '').toString(),
       code: (json['code'] ?? '').toString(),
       hostId: (json['hostId'] ?? '').toString(),
+      maxCapacity: (json['maxCapacity'] as num?)?.toInt() ?? 20,
       status: status,
       endTime: json['endTime'] == null
           ? null

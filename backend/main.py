@@ -8,9 +8,16 @@ from datetime import datetime, timezone
 from bson.objectid import ObjectId
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from pymongo import MongoClient
+from pymongo import MongoClient, ReturnDocument
 
-from backend.schemas.rooms import CreateRoomBody, JoinRoomBody, StartVotingBody, VoteBody
+from backend.schemas.rooms import (
+    CreateRoomBody,
+    JoinRoomBody,
+    KickBody,
+    StartVotingBody,
+    TransferHostBody,
+    VoteBody,
+)
 from backend.settings import Settings
 
 settings = Settings()
@@ -22,6 +29,8 @@ mongo_details = {}
 
 VOTE_DURATION_SECONDS = 60
 
+KICKED_BY_HOST_MESSAGE = "You were removed from the room by the host."
+
 
 # ---------------------------------------------------------------------------
 # Connection Manager
@@ -30,18 +39,15 @@ VOTE_DURATION_SECONDS = 60
 
 class ConnectionManager:
     """
-    Tracks active WebSocket connections grouped by room_id.
-
-    Structure:
-        self.rooms = {
-            "room_id_abc": {websocket_1, websocket_2, ...},
-            "room_id_xyz": {websocket_3, ...},
-        }
-
+    Tracks WebSockets per room and optionally binds each socket to a username
+    after a `join` message so the server can target users (kick) and run host
+    failover when the host's socket disconnects.
     """
 
     def __init__(self):
         self.rooms: dict[str, set[WebSocket]] = {}
+        self.user_sockets: dict[str, dict[str, set[WebSocket]]] = {}
+        self.ws_meta: dict[WebSocket, tuple[str, str]] = {}
 
     async def connect(self, room_id: str, websocket: WebSocket):
         """Accept the connection and register it under the given room."""
@@ -51,13 +57,42 @@ class ConnectionManager:
             "WS connected  room=%s  total=%d", room_id, len(self.rooms[room_id])
         )
 
-    def disconnect(self, room_id: str, websocket: WebSocket):
-        """Remove the connection.  Cleans up the room entry if it becomes empty."""
+    def bind(self, room_id: str, username: str, websocket: WebSocket) -> None:
+        if not username:
+            return
+        self.user_sockets.setdefault(room_id, {}).setdefault(username, set()).add(
+            websocket
+        )
+        self.ws_meta[websocket] = (room_id, username)
+
+    def _unbind_socket(self, websocket: WebSocket) -> tuple[str, str] | None:
+        meta = self.ws_meta.pop(websocket, None)
+        if not meta:
+            return None
+        rid, username = meta
+        users = self.user_sockets.get(rid, {})
+        bucket = users.get(username)
+        if bucket:
+            bucket.discard(websocket)
+            if not bucket:
+                users.pop(username, None)
+        if not users:
+            self.user_sockets.pop(rid, None)
+        return rid, username
+
+    def disconnect(self, room_id: str, websocket: WebSocket) -> str | None:
+        """
+        Remove the connection. Returns the bound username (if any) so callers
+        can schedule host failover.
+        """
+        meta = self._unbind_socket(websocket)
+        username = meta[1] if meta else None
         room = self.rooms.get(room_id, set())
         room.discard(websocket)
         if not room:
             self.rooms.pop(room_id, None)
         logger.info("WS disconnected  room=%s  remaining=%d", room_id, len(room))
+        return username
 
     async def broadcast(self, room_id: str, message: dict):
         """
@@ -75,6 +110,48 @@ class ConnectionManager:
                 dead.append(ws)
         for ws in dead:
             self.disconnect(room_id, ws)
+
+    async def send_to_user(self, room_id: str, username: str, message: dict) -> None:
+        for ws in list(self.user_sockets.get(room_id, {}).get(username, [])):
+            try:
+                await ws.send_json(message)
+            except Exception:
+                self.disconnect(room_id, ws)
+
+    async def close_user_connections(self, room_id: str, username: str) -> None:
+        for ws in list(self.user_sockets.get(room_id, {}).get(username, [])):
+            try:
+                await ws.close()
+            except Exception:
+                pass
+            self.disconnect(room_id, ws)
+
+    async def maybe_promote_host_after_disconnect(
+        self, room_id: str, disconnected_username: str | None
+    ) -> None:
+        """If the disconnected user was host, assign host to the first other participant."""
+        if not disconnected_username:
+            return
+        room = mongo_details["rooms"].find_one({"_id": ObjectId(room_id)})
+        if not room or room.get("hostId") != disconnected_username:
+            return
+        candidates = [
+            p["username"]
+            for p in room.get("participants", [])
+            if p["username"] != disconnected_username
+        ]
+        if not candidates:
+            return
+        new_host = candidates[0]
+        mongo_details["rooms"].update_one(
+            {"_id": ObjectId(room_id)},
+            {"$set": {"hostId": new_host}},
+        )
+        await self.broadcast(
+            room_id,
+            {"type": "host_changed", "hostId": new_host},
+        )
+        logger.info("Host promoted after WS disconnect  room=%s  host=%s", room_id, new_host)
 
 
 manager = ConnectionManager()
@@ -227,6 +304,7 @@ async def create_room(body: CreateRoomBody):
         "_id": room_id,
         "code": room_code,
         "hostId": body.host_name,
+        "maxCapacity": body.max_capacity,
         "status": "waiting",  # waiting → voting → finished
         "endTime": None,
         "winner": None,
@@ -239,7 +317,7 @@ async def create_room(body: CreateRoomBody):
 
 
 @app.post("/join-room", status_code=200)
-def join_room(body: JoinRoomBody):
+async def join_room(body: JoinRoomBody):
     code_upper = body.code.strip().upper()
     room = mongo_details["rooms"].find_one({"code": code_upper})
     if room is None and body.room_id:
@@ -254,22 +332,56 @@ def join_room(body: JoinRoomBody):
     if room["status"] != "waiting":
         raise HTTPException(status_code=400, detail="Voting has already started")
 
-    registered = [u["username"] for u in room["participants"]]
-    if body.username in registered:
+    oid = room["_id"]
+    updated = mongo_details["rooms"].find_one_and_update(
+        {
+            "_id": oid,
+            "code": code_upper,
+            "status": "waiting",
+            "participants": {"$not": {"$elemMatch": {"username": body.username}}},
+            "$expr": {
+                "$lt": [
+                    {"$size": "$participants"},
+                    {"$ifNull": ["$maxCapacity", 20]},
+                ]
+            },
+        },
+        {"$push": {"participants": {"username": body.username}}},
+        return_document=ReturnDocument.AFTER,
+    )
+
+    if updated is not None:
+        rid = str(updated["_id"])
+        await manager.broadcast(
+            rid,
+            {
+                "type": "participants_updated",
+                "participants": updated["participants"],
+                "hostId": updated["hostId"],
+            },
+        )
+        return {
+            "room_id": rid,
+            "code": updated["code"],
+            "restaurants": updated["options"],
+            "participants": updated["participants"],
+        }
+
+    cur = mongo_details["rooms"].find_one({"_id": oid})
+    if not cur:
+        raise HTTPException(status_code=404, detail="Room not found")
+    if cur["code"] != code_upper:
+        raise HTTPException(status_code=403, detail="Invalid room code")
+    if cur["status"] != "waiting":
+        raise HTTPException(status_code=400, detail="Voting has already started")
+    if body.username in {u["username"] for u in cur["participants"]}:
         raise HTTPException(
             status_code=400, detail="Username already taken in this room"
         )
-
-    mongo_details["rooms"].update_one(
-        {"_id": room["_id"]},
-        {"$push": {"participants": {"username": body.username}}},
-    )
-    return {
-        "room_id": str(room["_id"]),
-        "code": room["code"],
-        "restaurants": room["options"],
-        "participants": room["participants"] + [{"username": body.username}],
-    }
+    cap = cur.get("maxCapacity", 20)
+    if len(cur["participants"]) >= cap:
+        raise HTTPException(status_code=400, detail="Room is full")
+    raise HTTPException(status_code=400, detail="Could not join room")
 
 
 @app.post("/api/rooms/{room_id}/start", status_code=200)
@@ -346,6 +458,86 @@ async def vote_room_option(room_id: str, body: VoteBody):
     return {"status": "ok", "ended": ended}
 
 
+@app.post("/api/rooms/{room_id}/kick", status_code=200)
+async def kick_room_participant(room_id: str, body: KickBody):
+    room = mongo_details["rooms"].find_one({"_id": ObjectId(room_id)})
+    if not room:
+        raise HTTPException(status_code=404, detail="Room not found")
+    if room["hostId"] != body.userId:
+        raise HTTPException(status_code=403, detail="Only the host can remove participants")
+    if body.targetUsername == body.userId:
+        raise HTTPException(status_code=400, detail="You cannot remove yourself from the room")
+    usernames = {p["username"] for p in room.get("participants", [])}
+    if body.targetUsername not in usernames:
+        raise HTTPException(status_code=400, detail="User is not in this room")
+
+    mongo_details["rooms"].update_one(
+        {"_id": ObjectId(room_id)},
+        {
+            "$pull": {
+                "participants": {"username": body.targetUsername},
+                "voters": body.targetUsername,
+            }
+        },
+    )
+
+    await manager.send_to_user(
+        room_id,
+        body.targetUsername,
+        {
+            "type": "kicked_by_host",
+            "message": KICKED_BY_HOST_MESSAGE,
+        },
+    )
+    await manager.close_user_connections(room_id, body.targetUsername)
+
+    updated = mongo_details["rooms"].find_one({"_id": ObjectId(room_id)})
+    if not updated:
+        raise HTTPException(status_code=404, detail="Room not found")
+    await manager.broadcast(
+        room_id,
+        {
+            "type": "participants_updated",
+            "participants": updated["participants"],
+            "hostId": updated["hostId"],
+        },
+    )
+    return {"status": "ok"}
+
+
+@app.post("/api/rooms/{room_id}/transfer-host", status_code=200)
+async def transfer_room_host(room_id: str, body: TransferHostBody):
+    room = mongo_details["rooms"].find_one({"_id": ObjectId(room_id)})
+    if not room:
+        raise HTTPException(status_code=404, detail="Room not found")
+    if room["hostId"] != body.userId:
+        raise HTTPException(status_code=403, detail="Only the host can transfer host privileges")
+    usernames = {p["username"] for p in room.get("participants", [])}
+    if body.newHostUsername not in usernames:
+        raise HTTPException(
+            status_code=400, detail="New host must be an active participant in the room"
+        )
+    if body.newHostUsername == room["hostId"]:
+        raise HTTPException(status_code=400, detail="That user is already the host")
+
+    mongo_details["rooms"].update_one(
+        {"_id": ObjectId(room_id)},
+        {"$set": {"hostId": body.newHostUsername}},
+    )
+    updated = mongo_details["rooms"].find_one({"_id": ObjectId(room_id)})
+    if not updated:
+        raise HTTPException(status_code=404, detail="Room not found")
+    await manager.broadcast(
+        room_id,
+        {
+            "type": "host_changed",
+            "hostId": updated["hostId"],
+            "participants": updated["participants"],
+        },
+    )
+    return {"status": "ok", "hostId": updated["hostId"]}
+
+
 # ---------------------------------------------------------------------------
 # WebSocket Route
 # ---------------------------------------------------------------------------
@@ -388,18 +580,31 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str):
 
             # ── JOIN ────────────────────────────────────────────────────────
             if msg_type == "join":
+                if not username:
+                    await websocket.send_json(
+                        {"type": "error", "message": "Missing username"}
+                    )
+                    continue
                 room = mongo_details["rooms"].find_one({"_id": ObjectId(room_id)})
                 if not room:
                     await websocket.send_json(
                         {"type": "error", "message": "Room not found"}
                     )
                     continue
+                allowed = {p["username"] for p in room.get("participants", [])}
+                if username not in allowed:
+                    await websocket.send_json(
+                        {"type": "error", "message": "Not a participant in this room"}
+                    )
+                    continue
 
+                manager.bind(room_id, username, websocket)
                 await manager.broadcast(
                     room_id,
                     {
-                        "type": "user_joined",
+                        "type": "participants_updated",
                         "participants": room["participants"],
+                        "hostId": room["hostId"],
                     },
                 )
 
@@ -519,8 +724,14 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str):
 
 
     except WebSocketDisconnect:
-        manager.disconnect(room_id, websocket)
+        uname = manager.disconnect(room_id, websocket)
+        asyncio.create_task(
+            manager.maybe_promote_host_after_disconnect(room_id, uname)
+        )
         logger.info("Client disconnected cleanly  room=%s", room_id)
     except Exception as e:
         logger.exception("Unexpected WS error  room=%s", room_id)
-        manager.disconnect(room_id, websocket)
+        uname = manager.disconnect(room_id, websocket)
+        asyncio.create_task(
+            manager.maybe_promote_host_after_disconnect(room_id, uname)
+        )

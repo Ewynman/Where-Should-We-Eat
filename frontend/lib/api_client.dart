@@ -52,6 +52,7 @@ class ApiClient {
     String name, {
     required double latitude,
     required double longitude,
+    int maxCapacity = 10,
   }) async {
     final data = await _request(
       'POST',
@@ -60,6 +61,7 @@ class ApiClient {
         'host_name': name,
         'latitude': latitude,
         'longitude': longitude,
+        'max_capacity': maxCapacity,
       },
     );
     final map = data as Map<String, dynamic>;
@@ -82,11 +84,36 @@ class ApiClient {
         '_id': map['room_id'],
         'code': map['code'],
         'hostId': '',
+        'maxCapacity': 20,
         'status': 'waiting',
         'options': map['restaurants'] ?? [],
         'participants': map['participants'] ?? [],
       }),
       user: UserModel(id: name, name: name),
+    );
+  }
+
+  static Future<void> kickParticipant({
+    required String roomCode,
+    required String userId,
+    required String targetUsername,
+  }) async {
+    await _request(
+      'POST',
+      '/api/rooms/$roomCode/kick',
+      body: {'userId': userId, 'targetUsername': targetUsername},
+    );
+  }
+
+  static Future<void> transferHost({
+    required String roomCode,
+    required String userId,
+    required String newHostUsername,
+  }) async {
+    await _request(
+      'POST',
+      '/api/rooms/$roomCode/transfer-host',
+      body: {'userId': userId, 'newHostUsername': newHostUsername},
     );
   }
 
